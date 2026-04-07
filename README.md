@@ -25,11 +25,14 @@ Perfect for:
 
 ### Prerequisites
 
-- Node.js 16+ and npm
+- **Option A**: Node.js 16+ and npm
+- **Option B**: Docker and Docker Compose
 - A Flagmint API instance (local or remote)
 - A valid SDK key from your Flagmint environment
 
 ### Installation
+
+#### Option 1: Local Development (Node.js)
 
 ```bash
 # Clone or download this repository
@@ -44,7 +47,35 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in your browser, paste your SDK key, and connect!
 
-### Build for Production
+#### Option 2: Docker (Recommended for Consistency)
+
+**Using Docker Compose (Easiest):**
+
+```bash
+# Development mode (with hot reload)
+docker-compose up dev
+
+# Production mode (optimized build)
+docker-compose up prod
+```
+
+**Using Docker directly:**
+
+```bash
+# Development mode
+docker build --target development -t flagmint-sdk-tester:dev .
+docker run -p 5173:5173 -v $(pwd):/app -v /app/node_modules flagmint-sdk-tester:dev
+
+# Production mode
+docker build --target production -t flagmint-sdk-tester:prod .
+docker run -p 3000:3000 flagmint-sdk-tester:prod
+```
+
+**Access the application:**
+- Development: [http://localhost:5173](http://localhost:5173)
+- Production: [http://localhost:3000](http://localhost:3000)
+
+### Build for Production (Local)
 
 ```bash
 npm run build
