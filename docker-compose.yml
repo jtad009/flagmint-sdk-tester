@@ -15,12 +15,12 @@ services:
       - NODE_ENV=development
     command: npm run dev -- --host 0.0.0.0 --open false
 
-  # Production service
-  prod:
-    build:
-      context: .
-      target: production
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
+  # # Production service
+  # prod:
+  #   build:
+  #     context: .
+  #     target: production
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - NODE_ENV=production
