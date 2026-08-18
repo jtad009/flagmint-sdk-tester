@@ -23,13 +23,19 @@ const STATE_COLORS = {
   [CONNECTION_STATES.ERROR]: '#EF4444',
 };
 
+const TRANSPORTS = [
+  { id: 'sse', label: 'SSE' },
+  { id: 'websocket', label: 'WebSocket' },
+  { id: 'long-polling', label: 'Polling' },
+];
+
 // ─── App ────────────────────────────────────────────────────────
 
 export default function App() {
   // Config
   const [apiUrl, setApiUrl] = useState(() => localStorage.getItem('fm_tester_url') || 'http://localhost:3000');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('fm_tester_key') || '');
-  const [transport, setTransport] = useState('websocket');
+  const [transport, setTransport] = useState(() => localStorage.getItem('fm_tester_transport') || 'sse');
 
   // State
   const [connState, setConnState] = useState(CONNECTION_STATES.DISCONNECTED);
@@ -50,11 +56,13 @@ export default function App() {
   const nextId = useRef(10);
 
   const isConnected = connState === CONNECTION_STATES.CONNECTED;
+  const isConnecting = connState === CONNECTION_STATES.CONNECTING;
   const flagCount = Object.keys(flags).length;
 
   // Persist URL and key
   useEffect(() => { localStorage.setItem('fm_tester_url', apiUrl); }, [apiUrl]);
   useEffect(() => { localStorage.setItem('fm_tester_key', apiKey); }, [apiKey]);
+  useEffect(() => { localStorage.setItem('fm_tester_transport', transport); }, [transport]);
 
   // Auto-scroll log
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
@@ -149,6 +157,9 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: STATE_COLORS[connState], boxShadow: isConnected ? '0 0 8px #10B98166' : 'none', transition: 'all 0.3s' }} />
           <span style={{ fontSize: 12, color: STATE_COLORS[connState], textTransform: 'uppercase', letterSpacing: '0.08em' }}>{connState}</span>
+          <span style={{ fontSize: 11, color: '#4B5563', marginLeft: 4 }}>
+            {TRANSPORTS.find((t) => t.id === transport)?.label || transport}
+          </span>
           {isConnected && flagCount > 0 && (
             <span style={{ fontSize: 11, color: '#4B5563', marginLeft: 8 }}>{flagCount} flag{flagCount !== 1 ? 's' : ''}</span>
           )}
@@ -163,41 +174,41 @@ export default function App() {
           {/* Connection */}
           <div style={{ padding: 16, borderBottom: '1px solid #1E2533' }}>
             <label style={S.label}>API URL</label>
-            <input style={S.input} value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="http://localhost:3000" disabled={isConnected} />
+            <input style={S.input} value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="http://localhost:3000" disabled={isConnected || isConnecting} />
 
             <label style={{ ...S.label, marginTop: 12 }}>SDK Key</label>
-            <input style={S.input} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="ff_your_api_key" type="password" disabled={isConnected} />
+            <input style={S.input} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="ff_your_api_key" type="password" disabled={isConnected || isConnecting} />
 
             <label style={{ ...S.label, marginTop: 12 }}>Transport</label>
             <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-              {['websocket', 'long-polling'].map((t) => (
+              {TRANSPORTS.map(({ id, label }) => (
                 <button
-                  key={t}
-                  onClick={() => !isConnected && setTransport(t)}
-                  disabled={isConnected}
+                  key={id}
+                  onClick={() => !isConnected && !isConnecting && setTransport(id)}
+                  disabled={isConnected || isConnecting}
                   style={{
                     flex: 1, padding: '6px 0', fontSize: 12, borderRadius: 4,
-                    border: `1px solid ${transport === t ? PURPLE : '#2A3040'}`,
-                    background: transport === t ? `${PURPLE}22` : 'transparent',
-                    color: transport === t ? '#A78BFA' : '#6B7280',
-                    cursor: isConnected ? 'not-allowed' : 'pointer',
-                    opacity: isConnected ? 0.5 : 1,
+                    border: `1px solid ${transport === id ? PURPLE : '#2A3040'}`,
+                    background: transport === id ? `${PURPLE}22` : 'transparent',
+                    color: transport === id ? '#A78BFA' : '#6B7280',
+                    cursor: isConnected || isConnecting ? 'not-allowed' : 'pointer',
+                    opacity: isConnected || isConnecting ? 0.5 : 1,
                     fontFamily: FONT,
                   }}
                 >
-                  {t}
+                  {label}
                 </button>
               ))}
             </div>
 
             <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
-              {!isConnected ? (
-                <button onClick={handleConnect} disabled={!apiKey} style={{ ...S.btnPrimary, flex: 1, opacity: apiKey ? 1 : 0.4 }}>
-                  Connect
+              {isConnected || isConnecting ? (
+                <button onClick={handleDisconnect} style={{ ...S.btnDanger, flex: 1 }}>
+                  {isConnecting ? 'Cancel' : 'Disconnect'}
                 </button>
               ) : (
-                <button onClick={handleDisconnect} style={{ ...S.btnDanger, flex: 1 }}>
-                  Disconnect
+                <button onClick={handleConnect} disabled={!apiKey} style={{ ...S.btnPrimary, flex: 1, opacity: apiKey ? 1 : 0.4 }}>
+                  Connect
                 </button>
               )}
             </div>
@@ -278,7 +289,9 @@ export default function App() {
                   <div style={{ fontSize: 14, marginBottom: 6 }}>No flags received yet</div>
                   <div style={{ fontSize: 12 }}>
                     {isConnected
-                      ? 'Connected — waiting for flag data. Try sending a context update.'
+                      ? transport === 'sse'
+                        ? 'Connected — waiting for a flags event on the stream. Try Send Context or toggle a flag in the dashboard.'
+                        : 'Connected — waiting for flag data. Try sending a context update.'
                       : 'Enter your SDK key and connect to see flags.'}
                   </div>
                 </div>

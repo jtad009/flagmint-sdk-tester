@@ -12,14 +12,14 @@ Built for QA engineers, demos, and debugging
 
 ## 📋 Overview
 
-This app connects directly to your Flagmint API using the raw wire protocol (WebSocket or HTTP long-polling). It does **not** use any Flagmint SDK — this is intentional, so you're testing the server contract, not the SDK's interpretation of it.
+This app connects directly to your Flagmint API using the raw wire protocol (SSE, WebSocket, or HTTP long-polling). It does **not** use any Flagmint SDK — this is intentional, so you're testing the server contract, not the SDK's interpretation of it.
 
 Perfect for:
 - ✅ QA testing and validation
 - 🐛 Debugging feature flag behavior
 - 🎯 Testing targeting rules and context evaluation
 - 🔄 Verifying real-time updates
-- 📊 Comparing WebSocket vs long-polling transport
+- 📊 Comparing SSE vs WebSocket vs long-polling transport
 
 ## 🚀 Quick Start
 
@@ -45,7 +45,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173) in your browser, paste your SDK key, and connect!
+Open [http://localhost:5173](http://localhost:5173) in your browser, paste your SDK key, leave transport on **SSE**, and connect.
 
 #### Option 2: Docker (Recommended for Consistency)
 
@@ -85,9 +85,10 @@ npm run preview
 ## ✨ Features
 
 ### 🔌 Connection Management
-- **Dual Transport Support** — Switch between WebSocket and HTTP long-polling
+- **Three transports** — SSE (JavaScript SDK path), WebSocket (Go SDK path), and HTTP long-polling
+- **SSE protocol** — ASL handshake, flag stream, and context POST, matching the JS SDK
 - **Connection Status** — Real-time visual indicators for connection state
-- **Auto-reconnect** — Graceful handling of disconnections
+- **Auto-reconnect** — SSE re-handshakes after a drop (session IDs are single-use)
 
 ### 🎯 Context Evaluation
 - **Visual Context Builder** — Add/remove key-value pairs via UI
@@ -106,7 +107,7 @@ npm run preview
 - **Flag Search** — Filter flags by name for large projects
 
 ### 📡 Protocol Logging
-- **Message Inspector** — View raw WebSocket messages
+- **Message Inspector** — View handshake, SSE events (`connected`, `flags`, `quota_exceeded`, `error`), and HTTP context updates
 - **Connection Events** — Track connect, disconnect, and error events
 - **Debug Mode** — Toggle verbose logging for troubleshooting
 - **Auto-scroll** — Automatically follows latest log entries
@@ -118,7 +119,7 @@ npm run preview
 1. **Configure Connection**
    - Enter your API URL (e.g., `http://localhost:3000`)
    - Paste your SDK key
-   - Choose transport: WebSocket (recommended) or long-polling
+   - Choose transport: **SSE** (default, JS SDK), WebSocket (Go SDK), or Polling
 
 2. **Set Up Context**
    - Use a preset or manually add context fields
@@ -138,7 +139,18 @@ npm run preview
 4. **Verify Real-Time Updates**
    - Open Flagmint dashboard in another tab
    - Toggle a flag value or targeting rule
-   - Watch the tester update instantly (WebSocket)
+   - Watch the tester update instantly (SSE `flags` event, or WebSocket)
+
+### SSE protocol (JS SDK path)
+
+The tester speaks the same wire protocol as `flagmint-js-sdk`:
+
+1. `POST /auth/asl-handshake` with `x-api-key` → single-use `sessionId`
+2. `GET /evaluator/v2/flags/stream?sessionId&context&sdkVersion&platform&wrapper*` (no API key)
+3. Named events: `connected` (store `connectionId`), `flags`, `quota_exceeded`, `error`
+4. `POST /evaluator/v2/flags/context` with `{ connectionId, context }` and `x-api-key` → HTTP 202; flags arrive on the open stream after a 400ms debounce
+
+Watch the **Log** tab for handshake, `connectionId`, and event payloads.
 
 ### Testing Scenarios
 
@@ -176,6 +188,11 @@ Verify default fallback values are returned correctly.
 - [ ] Flag respects user targeting rules
 - [ ] Flag respects multi-context targeting
 - [ ] Flag updates in real-time when changed in dashboard
+- [ ] SSE handshake returns a `sessionId` (`POST /auth/asl-handshake`)
+- [ ] SSE stream opens (`GET /evaluator/v2/flags/stream`) and emits `connected` then `flags`
+- [ ] Send Context returns 202 and a new `flags` event after ~400ms
+- [ ] SSE reconnects with a **new** handshake after a drop (session is single-use)
+- [ ] Quota exhaustion emits `quota_exceeded` and closes the stream
 - [ ] WebSocket connection is stable (no disconnects)
 - [ ] Long-polling fallback works correctly
 - [ ] Empty context returns expected defaults
@@ -199,7 +216,7 @@ flagmint-sdk-tester/
 
 ### Key Files
 
-- **`connection.js`** — Raw protocol implementation. Handles WebSocket connections, long-polling, message parsing, and keep-alive pings.
+- **`connection.js`** — Raw protocol implementation. Handles SSE (handshake + stream + context POST), WebSocket, long-polling, message parsing, and keep-alive pings.
 - **`helpers.js`** — Context building logic, type detection, and preset configurations.
 - **`App.jsx`** — Complete UI with connection panel, context builder, flag viewer, and log inspector.
 
@@ -224,15 +241,18 @@ If your Flagmint API runs on a different origin, ensure CORS allows:
 ```
 Access-Control-Allow-Origin: http://localhost:5173
 Access-Control-Allow-Methods: POST, GET, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key
 ```
+
+SSE stream opens are GET with `sessionId` in the query string — do not send `x-api-key` on that request. Handshake and context updates use `x-api-key`.
 
 ## 🛠️ Tech Stack
 
 - **React 19** — UI framework
 - **Vite** — Build tool and dev server
-- **WebSocket API** — Real-time communication
-- **Fetch API** — Long-polling fallback
+- **EventSource API** — Server-Sent Events (JS SDK path)
+- **WebSocket API** — Real-time communication (Go SDK path)
+- **Fetch API** — ASL handshake, context POST, and long-polling fallback
 - **Local Storage** — Persistent configuration
 
 No external dependencies for networking or UI — pure browser APIs.
@@ -251,9 +271,16 @@ No external dependencies for networking or UI — pure browser APIs.
 - ✅ Try empty context to see default values
 - ✅ Check Protocol Log tab for server responses
 
+### SSE Stream Fails After Handshake
+- ✅ Handshake is not billable; opening the stream is. Check quota if you see `quota_exceeded`
+- ✅ `sessionId` is single-use — a second EventSource with the same id will fail
+- ✅ Do not send `x-api-key` on `GET /evaluator/v2/flags/stream`
+- ✅ Context on the stream URL is base64 JSON — avoid secrets/PII in context
+- ✅ CORS must allow GET and `x-api-key` (handshake + context POST)
+
 ### WebSocket Disconnects
 - ✅ Check API WebSocket endpoint is stable
-- ✅ Try long-polling transport as fallback
+- ✅ Try SSE or long-polling as fallback
 - ✅ Verify no firewall/proxy blocking WebSocket connections
 - ✅ Check API logs for errors
 
