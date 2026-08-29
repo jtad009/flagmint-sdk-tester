@@ -1,3 +1,74 @@
+// ─── Profile Helpers ────────────────────────────────────────────
+
+/** @import { Profile } from './types.js' */
+
+const PROFILE_COLORS = [
+  '#3B82F6', '#10B981', '#8B5CF6', '#F59E0B',
+  '#EF4444', '#EC4899', '#14B8A6', '#F97316',
+];
+
+const REQUIRED_PROFILE_FIELDS = ['id', 'name', 'apiUrl', 'apiKey', 'transport'];
+
+/**
+ * Validate a profile object, ensuring all required fields are present and
+ * the transport value is one of the accepted types.
+ *
+ * @param {Partial<Profile>} profile
+ * @returns {{ valid: boolean, errors: string[] }}
+ */
+export function validateProfile(profile) {
+  const errors = [];
+
+  if (!profile || typeof profile !== 'object') {
+    return { valid: false, errors: ['Profile must be a non-null object'] };
+  }
+
+  for (const field of REQUIRED_PROFILE_FIELDS) {
+    const val = profile[field];
+    if (val == null || val === '') {
+      errors.push(`Missing required field: ${field}`);
+    }
+  }
+
+  if (profile.transport && !['websocket', 'longpolling'].includes(profile.transport)) {
+    errors.push(`Invalid transport "${profile.transport}": must be "websocket" or "longpolling"`);
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Generate a UUID v4 string.
+ *
+ * Uses the Web Crypto API when available and falls back to a Math.random
+ * based implementation for environments that do not support it.
+ *
+ * @returns {string}
+ */
+export function generateProfileId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+
+  // Fallback: RFC 4122 v4 UUID
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/**
+ * Return the hex color assigned to a profile at the given index,
+ * cycling through the predefined palette if necessary.
+ *
+ * @param {number} index
+ * @returns {string} Hex color string, e.g. `"#3B82F6"`
+ */
+export function getProfileColor(index) {
+  return PROFILE_COLORS[index % PROFILE_COLORS.length];
+}
+
 // ─── Flag Type Helpers ──────────────────────────────────────────
 
 export function flagTypeLabel(val) {
