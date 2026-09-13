@@ -152,6 +152,23 @@ The tester speaks the same wire protocol as `flagmint-js-sdk`:
 
 Watch the **Log** tab for handshake, `connectionId`, and event payloads.
 
+### Config sync mode (local rules + lease)
+
+In the left panel switch **Config sync → fullConfig / deltas** (use **SSE** transport):
+
+1. Cold start (empty/expired localCache) → ASL handshake with ECDH → stream `fullConfig=true` → expect `lease` + `fullConfig` (MAC verified) → **local eval**
+2. Reconnect with valid cache → `fullConfig=false&sinceVersion=N` → `lease` + `deltas` (or lease only if current)
+3. **Send Context** re-evaluates locally; `POST /context` is telemetry only
+4. **QA** buttons (need FF-EU non-prod):
+   - **+25h** — advance server test clock past lease (no 24h wait)
+   - **Clear server** — wipe Redis `env:rules` for the API key env
+   - **Replay** — force recompile / publish
+   - **Clear localCache** — force next connect to request fullConfig
+
+Crypto / RulesStore / eval are **vendored** from `flagmint-js-sdk` into `src/lib/config-sync` (so Docker works without the monorepo). Refresh with `npm run sync:config-sync` when the SDK side changes.
+
+See `FF-EU/documentation/CONFIG_SYNC_QA.md` for curl recipes.
+
 ### Testing Scenarios
 
 #### Test User Targeting

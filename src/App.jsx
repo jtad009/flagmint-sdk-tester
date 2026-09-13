@@ -1,6 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createFlagmintConnection, CONNECTION_STATES } from './connection';
 import { buildContextFromFields, CONTEXT_PRESETS, flagTypeLabel, flagValueDisplay, flagValueShort, TYPE_COLORS, logColor } from './helpers';
+import {
+  clearLocalConfigCache,
+  isLocalLeaseExpired,
+  loadLocalConfigCache,
+  qaAdvanceClock,
+  qaClearConfig,
+  qaGetClock,
+  qaGetState,
+  qaReplayCompile,
+  qaResetClock,
+  saveLocalConfigCache,
+} from './qa';
 
 // ─── Shared Style Constants ─────────────────────────────────────
 
@@ -36,6 +48,10 @@ export default function App() {
   const [apiUrl, setApiUrl] = useState(() => localStorage.getItem('fm_tester_url') || 'http://localhost:3000');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('fm_tester_key') || '');
   const [transport, setTransport] = useState(() => localStorage.getItem('fm_tester_transport') || 'sse');
+  const [syncMode, setSyncMode] = useState(() => localStorage.getItem('fm_tester_sync_mode') || 'legacy');
+  const [leaseInfo, setLeaseInfo] = useState(null);
+  const [configMeta, setConfigMeta] = useState(null);
+  const [qaBusy, setQaBusy] = useState(false);
 
   // State
   const [connState, setConnState] = useState(CONNECTION_STATES.DISCONNECTED);
@@ -63,6 +79,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('fm_tester_url', apiUrl); }, [apiUrl]);
   useEffect(() => { localStorage.setItem('fm_tester_key', apiKey); }, [apiKey]);
   useEffect(() => { localStorage.setItem('fm_tester_transport', transport); }, [transport]);
+  useEffect(() => { localStorage.setItem('fm_tester_sync_mode', syncMode); }, [syncMode]);
 
   // Auto-scroll log
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
@@ -96,16 +113,79 @@ export default function App() {
     setFlags({});
     setFlagHistory({});
     setLogs([]);
+    setLeaseInfo(null);
+    setConfigMeta(null);
 
+    const cache = loadLocalConfigCache(apiKey);
     const conn = createFlagmintConnection({
-      url: apiUrl, apiKey, transport,
+      url: apiUrl,
+      apiKey,
+      transport,
+      syncMode: syncMode === 'config' ? 'config' : 'legacy',
       onFlags: setFlags,
       onState: setConnState,
       onLog: addLog,
+      initialRulesSnapshot:
+        syncMode === 'config' && cache && !isLocalLeaseExpired(cache) ? cache : undefined,
+      getSinceVersion: () => {
+        const c = loadLocalConfigCache(apiKey);
+        if (!c || isLocalLeaseExpired(c)) return undefined;
+        return typeof c.version === 'number' ? c.version : undefined;
+      },
+      forceFullConfig: () => {
+        const c = loadLocalConfigCache(apiKey);
+        return !c || isLocalLeaseExpired(c) || !Array.isArray(c.flags) || c.flags.length === 0;
+      },
+      onLease: (lease) => {
+        setLeaseInfo(lease);
+        const prev = loadLocalConfigCache(apiKey) || {};
+        // Version bookmark comes from RulesStore via onRulesSnapshot; lease mainly renews expiry.
+        saveLocalConfigCache(apiKey, {
+          ...prev,
+          expiresAt: lease.expiresAt ?? prev.expiresAt,
+          serverNow: lease.serverNow,
+          signature: lease.signature,
+        });
+      },
+      onConfig: (payload) => {
+        setConfigMeta({
+          type: payload.type,
+          version: payload.version ?? payload.toVersion,
+          warnings: payload.warnings,
+          fromVersion: payload.fromVersion,
+          toVersion: payload.toVersion,
+        });
+      },
+      onRulesSnapshot: (snapshot) => {
+        const prev = loadLocalConfigCache(apiKey) || {};
+        saveLocalConfigCache(apiKey, {
+          ...prev,
+          version: snapshot.version,
+          expiresAt: snapshot.expiresAt ?? prev.expiresAt,
+          flags: snapshot.flags,
+          segments: snapshot.segments,
+          updatedAt: new Date().toISOString(),
+          lastPayloadType: 'rulesSnapshot',
+        });
+      },
     });
     connRef.current = conn;
     conn.connect(context);
-  }, [apiUrl, apiKey, transport, context, addLog]);
+  }, [apiUrl, apiKey, transport, syncMode, context, addLog]);
+
+  const runQa = useCallback(async (label, fn) => {
+    if (!apiKey) return;
+    setQaBusy(true);
+    try {
+      const data = await fn();
+      addLog({ ts: new Date().toISOString(), level: 'info', msg: `QA ${label}`, data });
+      return data;
+    } catch (err) {
+      addLog({ ts: new Date().toISOString(), level: 'error', msg: `QA ${label} failed: ${err.message}` });
+    } finally {
+      setQaBusy(false);
+    }
+  }, [apiKey, addLog]);
 
   const handleDisconnect = useCallback(() => {
     connRef.current?.disconnect();
@@ -115,6 +195,28 @@ export default function App() {
   const handleSendContext = useCallback(() => {
     connRef.current?.sendContext(context);
   }, [context]);
+
+  const handleRequestFlag = useCallback(
+    (key) => {
+      const result = connRef.current?.requestFlag?.(key, context);
+      if (!result) return;
+      if (result.ok === false) {
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'warn',
+          msg: `getFlag(${key}) failed: ${result.reason}`,
+          data: result,
+        });
+        return;
+      }
+      if (result.legacy) {
+        return;
+      }
+      // Update only the requested flag so other cards' history stays put.
+      setFlags((prev) => ({ ...prev, [key]: result.value }));
+    },
+    [context, addLog],
+  );
 
   // Cleanup on unmount
   useEffect(() => () => connRef.current?.disconnect(), []);
@@ -211,6 +313,122 @@ export default function App() {
                   Connect
                 </button>
               )}
+            </div>
+          </div>
+
+          {/* Config sync + QA */}
+          <div style={{ padding: 16, borderBottom: '1px solid #1E2533' }}>
+            <span style={S.label}>Config sync</span>
+            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+              {[
+                { id: 'legacy', label: 'Legacy flags' },
+                { id: 'config', label: 'fullConfig / deltas' },
+              ].map(({ id, label }) => (
+                <button
+                  key={id}
+                  onClick={() => !isConnected && !isConnecting && setSyncMode(id)}
+                  disabled={isConnected || isConnecting}
+                  style={{
+                    flex: 1, padding: '6px 0', fontSize: 11, borderRadius: 4,
+                    border: `1px solid ${syncMode === id ? PURPLE : '#2A3040'}`,
+                    background: syncMode === id ? `${PURPLE}22` : 'transparent',
+                    color: syncMode === id ? '#A78BFA' : '#6B7280',
+                    cursor: isConnected || isConnecting ? 'not-allowed' : 'pointer',
+                    fontFamily: FONT,
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {syncMode === 'config' && (
+              <div style={{ marginTop: 10, fontSize: 11, color: '#6B7280', lineHeight: 1.45 }}>
+                {(() => {
+                  const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+                  const expired = !cache || isLocalLeaseExpired(cache);
+                  return (
+                    <>
+                      <div>localCache: {cache ? `v${cache.version}` : 'empty'}{expired ? ' (expired/missing → fullConfig)' : ' → sinceVersion'}</div>
+                      <div style={{ marginTop: 4 }}>SSE + ECDH MAC verify → local eval (not defaults-only)</div>
+                      {leaseInfo && (
+                        <div style={{ color: '#A78BFA', marginTop: 4 }}>
+                          lease exp {new Date(leaseInfo.expiresAt).toISOString()}
+                        </div>
+                      )}
+                      {configMeta && (
+                        <div style={{ marginTop: 4 }}>
+                          last: {configMeta.type}
+                          {configMeta.version != null ? ` @ v${configMeta.version}` : ''}
+                          {configMeta.warnings?.length ? ` ⚠ ${configMeta.warnings.length}` : ''}
+                        </div>
+                      )}
+                      {transport !== 'sse' && (
+                        <div style={{ color: '#F59E0B', marginTop: 4 }}>
+                          Use SSE transport for config-sync ECDH / local eval
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
+            <span style={{ ...S.label, marginTop: 14 }}>QA (clock / data)</span>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 6 }}>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('clock', () => qaGetClock(apiUrl, apiKey))}
+              >
+                Clock
+              </button>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('+25h', () => qaAdvanceClock(apiUrl, apiKey, { hours: 25 }))}
+              >
+                +25h
+              </button>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('reset clock', () => qaResetClock(apiUrl, apiKey))}
+              >
+                Reset clock
+              </button>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('state', () => qaGetState(apiUrl, apiKey))}
+              >
+                Server state
+              </button>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('clear Redis rules', () => qaClearConfig(apiUrl, apiKey))}
+              >
+                Clear server
+              </button>
+              <button
+                disabled={!apiKey || qaBusy}
+                style={S.btnGhost}
+                onClick={() => runQa('replay compile', () => qaReplayCompile(apiUrl, apiKey))}
+              >
+                Replay
+              </button>
+              <button
+                disabled={!apiKey}
+                style={{ ...S.btnGhost, gridColumn: '1 / -1' }}
+                onClick={() => {
+                  clearLocalConfigCache(apiKey);
+                  setLeaseInfo(null);
+                  setConfigMeta(null);
+                  addLog({ ts: new Date().toISOString(), level: 'info', msg: 'Cleared localConfig cache' });
+                }}
+              >
+                Clear localCache
+              </button>
             </div>
           </div>
 
@@ -330,7 +548,31 @@ export default function App() {
                           {/* Expanded Detail */}
                           {isExp && (
                             <div style={{ borderTop: '1px solid #1E2533', padding: '12px 14px', background: '#0D1017' }}>
-                              <span style={{ fontSize: 10, color: '#4B5563', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Current Value</span>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}>
+                                <span style={{ fontSize: 10, color: '#4B5563', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Current Value</span>
+                                <button
+                                  type="button"
+                                  title={
+                                    syncMode === 'config'
+                                      ? 'Local getFlag(key) with sidebar context (call-site eval proof)'
+                                      : 'Legacy: logs a call-site request; value comes from last server snapshot'
+                                  }
+                                  disabled={!isConnected}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRequestFlag(key);
+                                  }}
+                                  style={{
+                                    ...S.preset,
+                                    fontSize: 11,
+                                    padding: '4px 10px',
+                                    opacity: isConnected ? 1 : 0.45,
+                                    cursor: isConnected ? 'pointer' : 'not-allowed',
+                                  }}
+                                >
+                                  Evaluate
+                                </button>
+                              </div>
                               <pre style={{ fontSize: 11, color: '#8B949E', margin: '4px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                 {flagValueDisplay(val)}
                               </pre>
