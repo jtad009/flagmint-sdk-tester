@@ -677,7 +677,7 @@ export default function App() {
           {/* Tabs */}
           <div style={{ display: 'flex', borderBottom: `1px solid ${t.border}`, background: t.panel, padding: '0 16px', flexShrink: 0 }}>
             {[['flags', `Flags (${flagCount})`, 'Live flag values from the stream (or last poll).'], ['log', `Log (${logs.length})`, 'Connection, handshake, QA, and eval event log.']].map(([key, label, tip]) => (
-              <Tooltip key={key} content={tip} position="bottom">
+              <Tooltip key={key} content={tip} position="bottom" multiline>
                 <button
                   type="button"
                   onClick={() => setActiveTab(key)}

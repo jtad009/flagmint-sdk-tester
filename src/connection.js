@@ -169,6 +169,15 @@ export function createFlagmintConnection({
       });
       if (eventName === 'lease') onLease?.(payload);
       else onConfig?.(payload);
+
+      // Missed a patch while connected — tear down and come back with fullConfig
+      // (same recovery reconnect uses after a stream drop).
+      if (result.reason === 'version_gap' && !destroyed && sawConnected) {
+        log('warn', 'Config-sync version gap — reconnecting to request fullConfig');
+        closeEventSource();
+        connectionId = null;
+        scheduleSseReconnect();
+      }
       return;
     }
 
@@ -263,7 +272,9 @@ export function createFlagmintConnection({
     if (syncMode === 'config') {
       const since = typeof getSinceVersion === 'function' ? getSinceVersion() : undefined;
       const hasSince = Number.isInteger(since);
+      const storeWantsFull = configRuntime?.store?.wantsFullConfig?.() === true;
       const wantFull =
+        storeWantsFull ||
         (typeof forceFullConfig === 'function' && forceFullConfig()) ||
         !hasSince;
       params.set('fullConfig', wantFull ? 'true' : 'false');

@@ -31,7 +31,7 @@ const STEPS = [
 const COMMON_ISSUES = [
   {
     title: 'Config-sync delta rejected (version_gap)',
-    body: 'A patch arrived that does not line up with your local version bookmark, so it was refused on purpose (you keep the last good flags). Full sync is not a permanent manual step — the real SDK asks for fullConfig on the next reconnect. In this tester, clear the gap with Clear localCache, then Disconnect → Connect so the next open uses fullConfig=true. The stream does not auto-refresh in place when the gap appears.',
+    body: 'A patch arrived that does not line up with your local version bookmark, so it was refused on purpose (you keep the last good flags). The tester then reconnects and asks for fullConfig automatically. If you are still stuck, use Clear localCache → Disconnect → Connect. Live admin updates should appear without a manual reconnect once the API build that always broadcasts on flag_version_changed is deployed.',
   },
 ];
 
