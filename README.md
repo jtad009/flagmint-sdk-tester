@@ -117,7 +117,8 @@ npm run preview
 ### Basic Workflow
 
 1. **Configure Connection**
-   - Enter your API URL (e.g., `http://localhost:3000`)
+   - Pick an **Environment** (Local / Staging / Production) — API + Stream URLs fill in automatically
+   - Or choose **Custom** to edit both hosts (Stream URL is SSE-only; use for `staging-stream` / `stream`)
    - Paste your SDK key
    - Choose transport: **SSE** (default, JS SDK), WebSocket (Go SDK), or Polling
 
@@ -239,9 +240,17 @@ flagmint-sdk-tester/
 
 ## 🔧 Configuration
 
-### API URL
+### Environment / URLs
 
-Default: `http://localhost:3000`
+Pick **Local**, **Staging**, or **Production** to apply baked-in hosts:
+
+| Env | API (handshake / context / QA) | Stream (SSE) |
+|-----|--------------------------------|--------------|
+| Local | `http://localhost:3000` | same |
+| Staging | `https://staging-api.flagmint.com` | `https://staging-stream.flagmint.com` |
+| Production | `https://api.flagmint.com` | `https://stream.flagmint.com` |
+
+**Custom** lets you type both URLs. WebSocket and long-polling always use the API host.
 
 Update in the UI or set via localStorage:
 ```javascript

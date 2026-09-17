@@ -2,6 +2,20 @@
 
 All notable changes to the Flagmint SDK Tester are documented in this file.
 
+## [1.2.0] — 2026-09-17
+
+### Added
+
+- **Light + dark themes** with a header toggle (persisted). Default is light.
+- **Environment picker** (Local / Staging / Production / Custom) that fills API + Stream URLs.
+- Separate **Stream URL** for SSE (`staging-stream.flagmint.com` / `stream.flagmint.com`) while handshake, context, QA, and REST stay on the API host.
+- **How to use** panel and QA button tooltips (portal tooltip, Flagmint-style).
+
+### Changed
+
+- Connection layer opens EventSource on `streamUrl` and keeps ASL / context / evaluate / WebSocket on `apiUrl`.
+- QA buttons use a light surface so they stay readable in both themes.
+
 ## [1.1.0] — 2026-09-15
 
 ### Added

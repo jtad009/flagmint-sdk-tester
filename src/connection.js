@@ -98,6 +98,8 @@ function summarizeConfigPatch(eventName, payload) {
 
 export function createFlagmintConnection({
   url,
+  /** SSE host; defaults to `url`. Use stream.flagmint.com / staging-stream when testing CF bypass. */
+  streamUrl,
   apiKey,
   transport,
   onFlags,
@@ -117,7 +119,8 @@ export function createFlagmintConnection({
   /** Optional cache blob to hydrate RulesStore before connect (warm start) */
   initialRulesSnapshot,
 }) {
-  const baseUrl = trimSlash(url);
+  const apiBaseUrl = trimSlash(url);
+  const streamBaseUrl = trimSlash(streamUrl || url);
   const configRuntime = syncMode === 'config' ? createConfigSyncRuntime() : null;
   if (configRuntime && initialRulesSnapshot) {
     configRuntime.hydrateFromCache(initialRulesSnapshot);
@@ -202,7 +205,7 @@ export function createFlagmintConnection({
   // ─── SSE ────────────────────────────────────────────────────
 
   const handshake = async () => {
-    const handshakeUrl = `${baseUrl}/auth/asl-handshake`;
+    const handshakeUrl = `${apiBaseUrl}/auth/asl-handshake`;
     const withEcdh = syncMode === 'config';
     log('info', `ASL handshake POST ${handshakeUrl}`, { withEcdh });
 
@@ -234,7 +237,7 @@ export function createFlagmintConnection({
       const code = err?.code ? ` [${err.code}]` : '';
       if (err?.message?.includes('Failed to fetch') || err?.message?.includes('network')) {
         throw new Error(
-          `Handshake network error: ${err.message}. Is FF-EU running at ${baseUrl}, and is CORS allowing this origin?`,
+          `Handshake network error: ${err.message}. Is FF-EU running at ${apiBaseUrl}, and is CORS allowing this origin?`,
         );
       }
       throw new Error(`${err.message || 'Handshake failed'}${code}`);
@@ -269,12 +272,14 @@ export function createFlagmintConnection({
       }
     }
 
-    const streamUrl =
-      `${baseUrl}/evaluator/v2/flags/stream?${params.toString()}` +
+    const eventSourceUrl =
+      `${streamBaseUrl}/evaluator/v2/flags/stream?${params.toString()}` +
       `&context=${encodeContextQueryParam(context)}`;
 
-    log('info', `Opening SSE ${baseUrl}/evaluator/v2/flags/stream`, {
+    log('info', `Opening SSE ${streamBaseUrl}/evaluator/v2/flags/stream`, {
       sessionId: `${sessionId.slice(0, 16)}…`,
+      apiHost: apiBaseUrl,
+      streamHost: streamBaseUrl,
       syncMode,
       fullConfig: params.get('fullConfig'),
       sinceVersion: params.get('sinceVersion'),
@@ -282,7 +287,7 @@ export function createFlagmintConnection({
       note: 'Do not send x-api-key on this GET — the session token is the credential.',
     });
 
-    const es = new EventSource(streamUrl);
+    const es = new EventSource(eventSourceUrl);
     eventSource = es;
     sawConnected = false;
 
@@ -464,7 +469,7 @@ export function createFlagmintConnection({
       return;
     }
 
-    const contextUrl = `${baseUrl}/evaluator/v2/flags/context`;
+    const contextUrl = `${apiBaseUrl}/evaluator/v2/flags/context`;
     log('info', `POST ${contextUrl}`, {
       connectionId,
       context,
@@ -521,7 +526,7 @@ export function createFlagmintConnection({
   // ─── WebSocket ──────────────────────────────────────────────
 
   const connectWS = (context) => {
-    const wsUrl = baseUrl.replace(/^http/, 'ws');
+    const wsUrl = apiBaseUrl.replace(/^http/, 'ws');
     const fullUrl = `${wsUrl}/ws/sdk?apiKey=${apiKey}`;
     log('info', `Connecting WebSocket to ${wsUrl}/ws/sdk`, { apiKey: '***' });
 
@@ -579,13 +584,13 @@ export function createFlagmintConnection({
   // ─── Long Polling ───────────────────────────────────────────
 
   const connectPolling = async (context) => {
-    log('info', `Starting long-polling to ${baseUrl}/evaluator/evaluate`);
+    log('info', `Starting long-polling to ${apiBaseUrl}/evaluator/evaluate`);
 
     const doFetch = async () => {
       if (destroyed) return;
 
       try {
-        const res = await fetch(`${baseUrl}/evaluator/evaluate`, {
+        const res = await fetch(`${apiBaseUrl}/evaluator/evaluate`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
