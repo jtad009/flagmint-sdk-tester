@@ -28,6 +28,13 @@ const STEPS = [
   },
 ];
 
+const COMMON_ISSUES = [
+  {
+    title: 'Config-sync delta rejected (version_gap)',
+    body: 'A patch arrived that does not line up with your local version bookmark, so it was refused on purpose (you keep the last good flags). Full sync is not a permanent manual step — the real SDK asks for fullConfig on the next reconnect. In this tester, clear the gap with Clear localCache, then Disconnect → Connect so the next open uses fullConfig=true. The stream does not auto-refresh in place when the gap appears.',
+  },
+];
+
 export function HowToUsePanel({ open, onClose, theme }) {
   if (!open) return null;
   const t = theme;
@@ -107,6 +114,20 @@ export function HowToUsePanel({ open, onClose, theme }) {
               <div style={{ fontSize: 12, lineHeight: 1.5, color: t.muted }}>{step.body}</div>
             </div>
           ))}
+
+          <div style={{ borderTop: `1px solid ${t.border}`, paddingTop: 14, marginTop: 2 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: t.textStrong, marginBottom: 10 }}>
+              Common issues
+            </div>
+            {COMMON_ISSUES.map((issue) => (
+              <div key={issue.title} style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: t.accentSoft, marginBottom: 4 }}>
+                  {issue.title}
+                </div>
+                <div style={{ fontSize: 12, lineHeight: 1.5, color: t.muted }}>{issue.body}</div>
+              </div>
+            ))}
+          </div>
 
           <div
             style={{

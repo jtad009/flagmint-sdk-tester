@@ -262,12 +262,12 @@ export function createFlagmintConnection({
 
     if (syncMode === 'config') {
       const since = typeof getSinceVersion === 'function' ? getSinceVersion() : undefined;
+      const hasSince = Number.isInteger(since);
       const wantFull =
         (typeof forceFullConfig === 'function' && forceFullConfig()) ||
-        since === undefined ||
-        since === null;
+        !hasSince;
       params.set('fullConfig', wantFull ? 'true' : 'false');
-      if (!wantFull && Number.isInteger(since)) {
+      if (!wantFull) {
         params.set('sinceVersion', String(since));
       }
     }

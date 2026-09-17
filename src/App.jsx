@@ -235,12 +235,14 @@ export default function App() {
         setLeaseInfo(lease);
         const prev = loadLocalConfigCache(apiKey) || {};
         // Version bookmark comes from RulesStore via onRulesSnapshot; lease mainly renews expiry.
-        saveLocalConfigCache(apiKey, {
+        if (!saveLocalConfigCache(apiKey, {
           ...prev,
           expiresAt: lease.expiresAt ?? prev.expiresAt,
           serverNow: lease.serverNow,
           signature: lease.signature,
-        });
+        })) {
+          addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Failed to persist lease to localCache (storage full or disabled)' });
+        }
       },
       onConfig: (payload) => {
         setConfigMeta({
@@ -253,7 +255,7 @@ export default function App() {
       },
       onRulesSnapshot: (snapshot) => {
         const prev = loadLocalConfigCache(apiKey) || {};
-        saveLocalConfigCache(apiKey, {
+        if (!saveLocalConfigCache(apiKey, {
           ...prev,
           version: snapshot.version,
           expiresAt: snapshot.expiresAt ?? prev.expiresAt,
@@ -261,7 +263,9 @@ export default function App() {
           segments: snapshot.segments,
           updatedAt: new Date().toISOString(),
           lastPayloadType: 'rulesSnapshot',
-        });
+        })) {
+          addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Failed to persist rules snapshot to localCache (storage full or disabled)' });
+        }
       },
     });
     connRef.current = conn;

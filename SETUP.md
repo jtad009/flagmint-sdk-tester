@@ -147,15 +147,23 @@ Stop it the same way: `Ctrl` + `C` in PowerShell.
 The tester is just an empty shell until you point it at a Flagmint API. In the left-hand
 panel of the page:
 
-1. **API URL** — the address of the Flagmint API you're testing against. Ask the team for
-   this. If you're running the API on your own machine it's usually `http://localhost:3000`.
-2. **SDK key** — a key from the Flagmint environment you want to test. Ask the team, or copy
+1. **Environment** — pick **Local**, **Staging**, **Production**, or **Custom**. Local /
+   Staging / Production fill both URLs for you. Staging and Production use the API host
+   for handshake/QA and a separate **stream** host for SSE (Cloudflare bypass).
+2. **API URL** — handshake, context POST, and QA. For Local this is usually
+   `http://localhost:3000`. Ask the team if you're unsure.
+3. **Stream URL** — SSE only. On Local it matches the API URL. On Staging/Production the
+   Environment picker sets `staging-stream` / `stream.flagmint.com` for you. If you chose
+   **Custom**, enter both the API URL and the Stream URL yourself.
+4. **SDK key** — a key from the Flagmint environment you want to test. Ask the team, or copy
    it from the Flagmint dashboard. It's hidden as you type, like a password.
-3. Leave **Transport** on **SSE** (that's the default and the most common one).
-4. Click **Connect**. The status dot turns green when it works.
-5. Click **Send Context** to see which flags come back.
+5. Leave **Transport** on **SSE** (that's the default and the most common one). Prefer SSE
+   for config-sync (`fullConfig / deltas`).
+6. Click **Connect**. The status dot turns green when it works.
+7. Click **Send Context** to see which flags come back.
 
-Your API URL and SDK key are saved in the browser, so you only enter them once.
+Your Environment, API URL, Stream URL, and SDK key are saved in the browser, so you only
+enter them once.
 
 For what to actually test once you're connected, see the **QA Testing Checklist** section of
 `README.md`.
@@ -164,9 +172,18 @@ For what to actually test once you're connected, see the **QA Testing Checklist*
 
 ## If something goes wrong
 
-**"docker: command not found" or "The system cannot find the file specified"**
-Docker Desktop isn't running. Open it from the Start menu and wait for the green
-"Engine running" indicator, then try again.
+**"docker: command not found" or "docker is not recognized"**
+PowerShell cannot find the Docker CLI. That is not the same as Docker Desktop being
+stopped.
+
+1. Confirm Docker Desktop is installed (Step 2). If it isn't, install it and restart the PC.
+2. Close and reopen PowerShell so PATH updates take effect, then run `docker --version`.
+3. If it still fails, open Docker Desktop → Settings → General and confirm the CLI is
+   enabled, or reinstall Docker Desktop so `docker` is on your PATH.
+
+**"Cannot connect to the Docker daemon" / "engine is not running" / "The system cannot find the file specified"**
+The `docker` command is found, but the Docker engine isn't up. Open **Docker Desktop**
+from the Start menu and wait for the green **"Engine running"** indicator, then try again.
 
 **"port is already allocated" or "address already in use"**
 Something else is already using port 5173 — probably a copy of the tester you started
@@ -184,8 +201,10 @@ starting yet — give it another minute. If you see red error text, copy the who
 send it to the team.
 
 **Connect button turns red / connection fails**
-Usually the API URL or SDK key is wrong. Double-check both with the team. Also make sure the
-Flagmint API itself is actually running.
+Usually the API URL, Stream URL, or SDK key is wrong. Double-check Environment + both URLs
+and the key with the team. Also make sure the Flagmint API itself is actually running.
+For Staging/Production, handshake uses the API host and SSE uses the Stream host — both
+must be reachable.
 
 **Nothing appears in the Flags tab**
 Open the **Log** tab in the tester — it shows exactly what the server sent back, which

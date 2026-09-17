@@ -71,7 +71,12 @@ export function loadLocalConfigCache(apiKey) {
 }
 
 export function saveLocalConfigCache(apiKey, cache) {
-  localStorage.setItem(CACHE_PREFIX + apiKey, JSON.stringify(cache));
+  try {
+    localStorage.setItem(CACHE_PREFIX + apiKey, JSON.stringify(cache));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function clearLocalConfigCache(apiKey) {
