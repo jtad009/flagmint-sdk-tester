@@ -490,13 +490,13 @@ export default function App() {
 
             <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
               {isConnected || isConnecting ? (
-                <Tooltip content={isConnecting ? 'Cancel the in-flight connect attempt.' : 'Close the stream / socket and stop reconnecting.'} fill style={{ flex: 1 }}>
+                <Tooltip multiline content={isConnecting ? 'Cancel the in-flight connect attempt.' : 'Close the stream / socket and stop reconnecting.'} fill style={{ flex: 1 }}>
                   <button onClick={handleDisconnect} style={{ ...S.btnDanger, width: '100%' }}>
                     {isConnecting ? 'Cancel' : 'Disconnect'}
                   </button>
                 </Tooltip>
               ) : (
-                <Tooltip content="Handshake on API URL, then open SSE on Stream URL (or WS/poll on API)." fill style={{ flex: 1 }}>
+                <Tooltip multiline content="Handshake on API URL, then open SSE on Stream URL (or WS/poll on API)." fill style={{ flex: 1 }}>
                   <button onClick={handleConnect} disabled={!apiKey || !apiUrl || !streamUrl} style={{ ...S.btnPrimary, width: '100%', opacity: apiKey && apiUrl && streamUrl ? 1 : 0.4 }}>
                     Connect
                   </button>
