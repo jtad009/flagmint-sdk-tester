@@ -117,7 +117,8 @@ npm run preview
 ### Basic Workflow
 
 1. **Configure Connection**
-   - Enter your API URL (e.g., `http://localhost:3000`)
+   - Pick an **Environment** (Local / Staging / Production) — API + Stream URLs fill in automatically
+   - Or choose **Custom** to edit both hosts (Stream URL is SSE-only; use for `staging-stream` / `stream`)
    - Paste your SDK key
    - Choose transport: **SSE** (default, JS SDK), WebSocket (Go SDK), or Polling
 
@@ -151,6 +152,23 @@ The tester speaks the same wire protocol as `flagmint-js-sdk`:
 4. `POST /evaluator/v2/flags/context` with `{ connectionId, context }` and `x-api-key` → HTTP 202; flags arrive on the open stream after a 400ms debounce
 
 Watch the **Log** tab for handshake, `connectionId`, and event payloads.
+
+### Config sync mode (local rules + lease)
+
+In the left panel switch **Config sync → fullConfig / deltas** (use **SSE** transport):
+
+1. Cold start (empty/expired localCache) → ASL handshake with ECDH → stream `fullConfig=true` → expect `lease` + `fullConfig` (MAC verified) → **local eval**
+2. Reconnect with valid cache → `fullConfig=false&sinceVersion=N` → `lease` + `deltas` (or lease only if current)
+3. **Send Context** re-evaluates locally; `POST /context` is telemetry only
+4. **QA** buttons (need FF-EU non-prod):
+   - **+25h** — advance server test clock past lease (no 24h wait)
+   - **Clear server** — wipe Redis `env:rules` for the API key env
+   - **Replay** — force recompile / publish
+   - **Clear localCache** — force next connect to request fullConfig
+
+Crypto / RulesStore / eval are **vendored** from `flagmint-js-sdk` into `src/lib/config-sync` (so Docker works without the monorepo). Refresh with `npm run sync:config-sync` when the SDK side changes.
+
+See `FF-EU/documentation/CONFIG_SYNC_QA.md` for curl recipes.
 
 ### Testing Scenarios
 
@@ -222,9 +240,17 @@ flagmint-sdk-tester/
 
 ## 🔧 Configuration
 
-### API URL
+### Environment / URLs
 
-Default: `http://localhost:3000`
+Pick **Local**, **Staging**, or **Production** to apply baked-in hosts:
+
+| Env | API (handshake / context / QA) | Stream (SSE) |
+|-----|--------------------------------|--------------|
+| Local | `http://localhost:3000` | same |
+| Staging | `https://staging-api.flagmint.com` | `https://staging-stream.flagmint.com` |
+| Production | `https://api.flagmint.com` | `https://stream.flagmint.com` |
+
+**Custom** lets you type both URLs. WebSocket and long-polling always use the API host.
 
 Update in the UI or set via localStorage:
 ```javascript
