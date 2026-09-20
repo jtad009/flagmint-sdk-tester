@@ -2,6 +2,31 @@
 
 All notable changes to the Flagmint SDK Tester are documented in this file.
 
+## [1.3.0] — 2026-09-20
+
+### Added
+
+- **Tools** tab for config-sync QA without digging the log:
+  - **Live patch inspection** — upserts, deletes, and segment ids after each verified `fullConfig` / `delta` / `deltas`
+  - **Track events** — send `custom` or `error` to `/evaluator/events` (Evaluate still auto-reports `evaluation`)
+  - **Same-version check** — plain-English REST helper (`GET /flags/config?sinceVersion=N`) to prove lease-only; raw JSON under “Show raw response”
+  - **Tamper demo** — flip the last payload signature and prove reject
+  - **Coverage** note — wire protocol + vendored config-sync by design; not the published `FlagClient` (`ready()`, tab sharing, SSE→poll fallback, npm packaging)
+- **QA client clock** — Clock / +25h / Reset mirror the server offset onto the tester lease timer so +25h expires leases without waiting a day; lease gate re-runs after advance
+- Collapsible sidebar sections (Connection, Config sync, QA, Evaluation context), collapsed by default; Connect / Disconnect stays pinned
+- Plain-English config-sync status (**Flags ready** / **Rules expired**) with **Show technical details** for cache version and lease ISO
+- How-to guide bodies support light markdown (paragraphs, lists, `` `code` ``, `**bold**`)
+
+### Changed
+
+- Config-sync “Flags ready” requires a cache with **version and flags** (aligned with `forceFullConfig` / reconnect)
+- Expired lease while disconnected says **Rules expired** (not “renewing”)
+- How-to QA clock copy: **Clock** only syncs the tester; **+25h** / **Reset** move the server clock then sync
+
+### Notes
+
+- Still requires FF-EU with config-sync + QA routes for clock / clear / replay. Use **SSE** for config-sync mode.
+
 ## [1.2.0] — 2026-09-17
 
 ### Added

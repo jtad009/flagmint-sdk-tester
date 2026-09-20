@@ -26,7 +26,7 @@ export const CONNECTION_STATES = {
   ERROR: 'error',
 };
 
-const TESTER_WRAPPER = { name: 'sdk-tester', version: '1.0.0' };
+const TESTER_WRAPPER = { name: 'sdk-tester', version: '1.3.0' };
 const MAX_RECONNECT_DELAY_MS = 15000;
 
 function trimSlash(url) {

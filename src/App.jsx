@@ -108,8 +108,7 @@ function isLocalRulesCacheComplete(cache) {
   return (
     !!cache &&
     typeof cache.version === 'number' &&
-    Array.isArray(cache.flags) &&
-    cache.flags.length > 0
+    Array.isArray(cache.flags)
   );
 }
 
@@ -131,7 +130,7 @@ function formatLeaseWhen(ms) {
 }
 
 /**
- * Plain-English config-sync status for the sidebar (Option B — simple layer).
+ * config-sync status for the sidebar.
  *
  * @param {{
  *   cache: { version?: number, expiresAt?: number, flags?: unknown[] }|null,
@@ -572,7 +571,7 @@ export default function App() {
             <span style={{ color: '#fff', fontSize: 14, fontWeight: 700 }}>F</span>
           </div>
           <span style={{ fontWeight: 700, fontSize: 15, color: t.textStrong, letterSpacing: '0.02em' }}>SDK Tester</span>
-          <span style={{ fontSize: 11, color: t.muted, border: `1px solid ${t.borderStrong}`, borderRadius: 4, padding: '2px 8px' }}>v1.2</span>
+          <span style={{ fontSize: 11, color: t.muted, border: `1px solid ${t.borderStrong}`, borderRadius: 4, padding: '2px 8px' }}>v1.3</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Tooltip
