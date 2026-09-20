@@ -99,6 +99,21 @@ const PRESET_TIPS = {
 };
 
 /**
+ * Whether localCache has a version and at least one flag rule (usable for local eval).
+ *
+ * @param {{ version?: number, flags?: unknown[] }|null|undefined} cache
+ * @returns {boolean}
+ */
+function isLocalRulesCacheComplete(cache) {
+  return (
+    !!cache &&
+    typeof cache.version === 'number' &&
+    Array.isArray(cache.flags) &&
+    cache.flags.length > 0
+  );
+}
+
+/**
  * Format a lease expiry for non-technical readers.
  *
  * @param {number} ms Epoch ms
@@ -119,15 +134,23 @@ function formatLeaseWhen(ms) {
  * Plain-English config-sync status for the sidebar (Option B — simple layer).
  *
  * @param {{
- *   cache: { version?: number, expiresAt?: number }|null,
+ *   cache: { version?: number, expiresAt?: number, flags?: unknown[] }|null,
  *   leaseExpiresAt: number|undefined,
  *   expired: boolean,
  *   transport: string,
  *   clientOffsetMs: number,
+ *   isConnected: boolean,
  * }} input
  * @returns {{ headline: string, detail: string|null, warn: string|null }}
  */
-function configSyncPlainStatus({ cache, leaseExpiresAt, expired, transport, clientOffsetMs }) {
+function configSyncPlainStatus({
+  cache,
+  leaseExpiresAt,
+  expired,
+  transport,
+  clientOffsetMs,
+  isConnected,
+}) {
   if (transport !== 'sse') {
     return {
       headline: 'Switch to SSE to use this mode',
@@ -135,7 +158,7 @@ function configSyncPlainStatus({ cache, leaseExpiresAt, expired, transport, clie
       warn: null,
     };
   }
-  if (!cache || typeof cache.version !== 'number') {
+  if (!isLocalRulesCacheComplete(cache)) {
     return {
       headline: 'No saved rules yet',
       detail: 'Next connect will download a full copy of the flag rules.',
@@ -144,10 +167,14 @@ function configSyncPlainStatus({ cache, leaseExpiresAt, expired, transport, clie
   }
   if (expired) {
     return {
-      headline: 'Rules expired — renewing',
+      headline: isConnected ? 'Rules expired — renewing' : 'Rules expired',
       detail: leaseExpiresAt
-        ? `This copy ran out at ${formatLeaseWhen(leaseExpiresAt)}. Safe defaults are used until a fresh copy arrives.`
-        : 'Safe defaults are used until a fresh copy of the rules arrives.',
+        ? isConnected
+          ? `This copy ran out at ${formatLeaseWhen(leaseExpiresAt)}. Safe defaults are used until a fresh copy arrives.`
+          : `This copy ran out at ${formatLeaseWhen(leaseExpiresAt)}. Connect again to download a fresh copy.`
+        : isConnected
+          ? 'Safe defaults are used until a fresh copy of the rules arrives.'
+          : 'Connect again to download a fresh copy of the rules.',
       warn: clientOffsetMs !== 0 ? 'Test clock is shifted ahead so you can practice expiry without waiting a day.' : null,
     };
   }
@@ -322,15 +349,17 @@ export default function App() {
       onLog: addLog,
       onConfigPatch: setLastPatch,
       initialRulesSnapshot:
-        syncMode === 'config' && cache && !isLocalLeaseExpired(cache) ? cache : undefined,
+        syncMode === 'config' && cache && !isLocalLeaseExpired(cache) && isLocalRulesCacheComplete(cache)
+          ? cache
+          : undefined,
       getSinceVersion: () => {
         const c = loadLocalConfigCache(apiKey);
-        if (!c || isLocalLeaseExpired(c)) return undefined;
+        if (!c || isLocalLeaseExpired(c) || !isLocalRulesCacheComplete(c)) return undefined;
         return typeof c.version === 'number' ? c.version : undefined;
       },
       forceFullConfig: () => {
         const c = loadLocalConfigCache(apiKey);
-        return !c || isLocalLeaseExpired(c) || !Array.isArray(c.flags) || c.flags.length === 0;
+        return !c || isLocalLeaseExpired(c) || !isLocalRulesCacheComplete(c);
       },
       onLease: (lease) => {
         setLeaseInfo(lease);
@@ -714,13 +743,17 @@ export default function App() {
 
             <CollapsibleSection
               title="Config sync"
-              summary={
-                syncMode === 'legacy'
-                  ? 'Legacy flags'
-                  : syncMode === 'config' && leaseInfo
-                    ? (isLocalLeaseExpired({ expiresAt: leaseInfo.expiresAt }) ? 'Rules expired' : 'Flags ready')
-                    : 'fullConfig / deltas'
-              }
+              summary={(() => {
+                if (syncMode === 'legacy') return 'Legacy flags';
+                void qaClockEpoch;
+                const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+                const leaseExpiresAt = leaseInfo?.expiresAt ?? cache?.expiresAt;
+                if (!isLocalRulesCacheComplete(cache)) return 'No saved rules';
+                if (!leaseExpiresAt || isLocalLeaseExpired({ expiresAt: leaseExpiresAt })) {
+                  return isConnected || isConnecting ? 'Rules expired — renewing' : 'Rules expired';
+                }
+                return 'Flags ready';
+              })()}
               open={openSections.configSync}
               onToggle={() => toggleSection('configSync')}
               theme={t}
@@ -763,6 +796,7 @@ export default function App() {
                       expired,
                       transport,
                       clientOffsetMs: clientClock.offsetMs,
+                      isConnected: isConnected || isConnecting,
                     });
                     return (
                       <>
