@@ -289,7 +289,11 @@ export function createFlagmintConnection({
     else onConfig?.(payload);
 
     onRulesSnapshot?.(result.snapshot);
-    leaseRenewInFlight = false;
+    // Lease alone can arrive while needsFullConfig is still set — keep the
+    // renewal marker until the store is actually ready for local eval.
+    if (configRuntime.isLeaseReady()) {
+      leaseRenewInFlight = false;
+    }
 
     // Lease alone may not change flags; still re-eval when we have rules.
     if (result.state.flags.size > 0 && !result.state.needsFullConfig) {
@@ -297,6 +301,16 @@ export function createFlagmintConnection({
     } else if (eventName === 'fullConfig' || eventName === 'deltas' || eventName === 'delta') {
       applyFlags(result.evaluated, `${eventName} local eval`);
     }
+  };
+
+  /**
+   * Allow a later getFlag / context call to start another lease renew after a
+   * terminal connect failure (handshake/stream never reached a ready store).
+   *
+   * @returns {void}
+   */
+  const clearLeaseRenewInFlight = () => {
+    leaseRenewInFlight = false;
   };
 
   const clearTimers = () => {
@@ -496,6 +510,7 @@ export function createFlagmintConnection({
       }
 
       destroyed = true;
+      clearLeaseRenewInFlight();
       closeEventSource();
       connectionId = null;
       onState(CONNECTION_STATES.ERROR);
@@ -517,6 +532,7 @@ export function createFlagmintConnection({
         return;
       }
 
+      clearLeaseRenewInFlight();
       onState(CONNECTION_STATES.ERROR);
     });
 
@@ -535,6 +551,7 @@ export function createFlagmintConnection({
         return;
       }
 
+      clearLeaseRenewInFlight();
       log('error', 'SSE stream failed to open. Check handshake, CORS, and API URL (Network tab).');
       onState(CONNECTION_STATES.ERROR);
     };
@@ -590,9 +607,13 @@ export function createFlagmintConnection({
 
     try {
       const sessionId = await handshake();
-      if (destroyed) return;
+      if (destroyed) {
+        clearLeaseRenewInFlight();
+        return;
+      }
       openStream(sessionId, context || {});
     } catch (err) {
+      clearLeaseRenewInFlight();
       log('error', `SSE connect failed: ${err.message}`, { error: err.message });
       onState(CONNECTION_STATES.ERROR);
     }
@@ -847,6 +868,7 @@ export function createFlagmintConnection({
 
   const disconnect = () => {
     destroyed = true;
+    clearLeaseRenewInFlight();
     clearTimers();
     closeEventSource();
     connectionId = null;

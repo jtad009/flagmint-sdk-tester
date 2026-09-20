@@ -11,6 +11,18 @@
 let clientOffsetMs = 0;
 
 /**
+ * Whether an epoch ms value is representable as a JS Date (toISOString-safe).
+ *
+ * @param {number} ms Candidate timestamp
+ * @returns {boolean}
+ */
+function isSafeJsDateMs(ms) {
+  if (!Number.isFinite(ms)) return false;
+  const t = new Date(ms).getTime();
+  return Number.isFinite(t);
+}
+
+/**
  * Snapshot of the tester's mirrored QA clock.
  *
  * @returns {{ wallClockMs: number, offsetMs: number, effectiveNowMs: number, effectiveNowIso: string }}
@@ -22,7 +34,9 @@ export function getQaClientClockState() {
     wallClockMs,
     offsetMs: clientOffsetMs,
     effectiveNowMs,
-    effectiveNowIso: new Date(effectiveNowMs).toISOString(),
+    effectiveNowIso: isSafeJsDateMs(effectiveNowMs)
+      ? new Date(effectiveNowMs).toISOString()
+      : new Date(wallClockMs).toISOString(),
   };
 }
 
@@ -37,15 +51,21 @@ export function qaClientNowMs() {
 
 /**
  * Mirror a server QA clock response onto the tester's client timer.
+ * Ignores offsets that would produce an invalid JS Date.
  *
  * @param {{ offsetMs?: number, effectiveNowMs?: number }|null|undefined} clock
  * @returns {ReturnType<typeof getQaClientClockState>}
  */
 export function syncQaClientClock(clock) {
   if (clock && typeof clock.offsetMs === 'number' && Number.isFinite(clock.offsetMs)) {
-    clientOffsetMs = clock.offsetMs;
+    const effectiveNowMs = Date.now() + clock.offsetMs;
+    if (isSafeJsDateMs(effectiveNowMs)) {
+      clientOffsetMs = clock.offsetMs;
+    }
   } else if (clock && typeof clock.effectiveNowMs === 'number' && Number.isFinite(clock.effectiveNowMs)) {
-    clientOffsetMs = clock.effectiveNowMs - Date.now();
+    if (isSafeJsDateMs(clock.effectiveNowMs)) {
+      clientOffsetMs = clock.effectiveNowMs - Date.now();
+    }
   }
   return getQaClientClockState();
 }
