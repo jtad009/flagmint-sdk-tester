@@ -17,6 +17,7 @@
 import { performAslHandshake } from '@flagmint/config-sync';
 import { createConfigSyncRuntime } from './configSyncRuntime';
 import { qaClientNowMs } from './qa';
+import { describeConfigPatch } from './configPatchSummary';
 
 export const CONNECTION_STATES = {
   DISCONNECTED: 'disconnected',
@@ -111,6 +112,8 @@ export function createFlagmintConnection({
   /** Optional hooks for config-sync events */
   onLease,
   onConfig,
+  /** Structured upsert/delete/segment summary after each config event */
+  onConfigPatch,
   /** After a verified apply — persist RulesStore snapshot for localCache */
   onRulesSnapshot,
   /** () => number | undefined — localCache version for sinceVersion */
@@ -144,8 +147,24 @@ export function createFlagmintConnection({
   /** Analytics map from SSE `flags` packets; null until received. */
   let analyticsByFlag = null;
 
+  /** Last signed config payload (for tamper demo). */
+  let lastSignedConfig = null;
+
   const log = (level, msg, data) => {
     onLog?.({ ts: new Date().toISOString(), level, msg, data });
+  };
+
+  /**
+   * Notify UI with a plain summary of upserts / deletes / segments.
+   *
+   * @param {string} eventName
+   * @param {Record<string, unknown>} payload
+   * @param {{ ok?: boolean, reason?: string }} [meta]
+   * @returns {void}
+   */
+  const emitConfigPatch = (eventName, payload, meta = {}) => {
+    const summary = describeConfigPatch(eventName, payload, meta);
+    onConfigPatch?.(summary);
   };
 
   /**
@@ -263,6 +282,7 @@ export function createFlagmintConnection({
         version: configRuntime.getState().version,
         needsFullConfig: result.state?.needsFullConfig,
       });
+      emitConfigPatch(eventName, payload, { ok: false, reason: result.reason });
       if (eventName === 'lease') onLease?.(payload);
       else onConfig?.(payload);
 
@@ -277,6 +297,7 @@ export function createFlagmintConnection({
       return;
     }
 
+    lastSignedConfig = { eventName, payload };
     log('info', `Config-sync ${eventName} verified + applied`, {
       version: result.state.version,
       expiresAt: result.state.expiresAt,
@@ -284,6 +305,7 @@ export function createFlagmintConnection({
       needsFullConfig: result.state.needsFullConfig,
       ...summarizeConfigPatch(eventName, payload),
     });
+    emitConfigPatch(eventName, payload, { ok: true });
 
     if (eventName === 'lease') onLease?.(payload);
     else onConfig?.(payload);
@@ -866,12 +888,155 @@ export function createFlagmintConnection({
     return { ok: true, value, key, legacy: true };
   };
 
+  /**
+   * POST custom / error / evaluation events to /evaluator/events.
+   *
+   * @param {{
+   *   kind: 'custom'|'error'|'evaluation',
+   *   flagKey: string,
+   *   eventName?: string,
+   *   variationValue?: unknown,
+   * }} input
+   * @returns {Promise<{ ok: boolean, status?: number, body?: unknown, error?: string }>}
+   */
+  const sendTrackEvent = async (input) => {
+    const flagKey = String(input?.flagKey || '').trim();
+    if (!flagKey) return { ok: false, error: 'flagKey required' };
+    const kind = input.kind || 'custom';
+    const event = {
+      flagKey,
+      kind,
+      userKey: userKeyFromContext(currentContext),
+      timestamp: new Date().toISOString(),
+    };
+    if (kind === 'custom') {
+      const eventName = String(input.eventName || '').trim();
+      if (!eventName) return { ok: false, error: 'eventName required for custom' };
+      event.eventName = eventName;
+    } else if (input.eventName) {
+      event.eventName = String(input.eventName);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, 'variationValue')) {
+      event.variationValue = input.variationValue;
+    }
+
+    try {
+      const res = await fetch(`${apiBaseUrl}/evaluator/events`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+        },
+        body: JSON.stringify({ events: [event] }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        log('warn', `Track ${kind} failed (${res.status})`, body);
+        return { ok: false, status: res.status, body };
+      }
+      log('info', `Track ${kind} accepted`, { flagKey, eventName: event.eventName });
+      return { ok: true, status: res.status, body };
+    } catch (err) {
+      log('warn', `Track ${kind} network error: ${err?.message || err}`);
+      return { ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  /**
+   * One-shot REST catch-up: ECDH handshake + GET /evaluator/v2/flags/config.
+   * Use sinceVersion = current cache version to prove lease-only.
+   *
+   * @param {number} [sinceVersion]
+   * @returns {Promise<{ ok: boolean, payload?: Record<string, unknown>, error?: string }>}
+   */
+  const fetchRestConfig = async (sinceVersion) => {
+    if (syncMode !== 'config') {
+      return { ok: false, error: 'Switch to fullConfig / deltas mode first' };
+    }
+    try {
+      const result = await performAslHandshake({
+        handshakeUrl: `${apiBaseUrl}/auth/asl-handshake`,
+        apiKey,
+        withEcdh: true,
+      });
+      if (!result.configMacKey) {
+        return { ok: false, error: 'ECDH MAC key missing from handshake' };
+      }
+      const params = new URLSearchParams({ sessionId: result.sessionId });
+      if (Number.isInteger(sinceVersion)) {
+        params.set('sinceVersion', String(sinceVersion));
+      }
+      const res = await fetch(`${apiBaseUrl}/evaluator/v2/flags/config?${params}`, {
+        headers: { 'x-api-key': apiKey },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        log('warn', `REST flags/config failed (${res.status})`, body);
+        return { ok: false, error: body.message || body.error || `HTTP ${res.status}`, status: res.status };
+      }
+      const payload = body.data ?? body;
+      log('info', 'REST flags/config', {
+        type: payload.type,
+        version: payload.version,
+        sinceVersion,
+      });
+      // Verify with a throwaway store so we do not mutate the live stream store.
+      const probe = createConfigSyncRuntime();
+      probe.setMacKey(result.configMacKey);
+      const apply = probe.applySignedEvent(payload.type || 'lease', payload, currentContext || {});
+      probe.clearMacKey();
+      if (!apply.ok) {
+        emitConfigPatch(payload.type || 'lease', payload, { ok: false, reason: apply.reason });
+        return { ok: false, error: `signature/apply failed: ${apply.reason}`, payload };
+      }
+      emitConfigPatch(payload.type || 'lease', payload, { ok: true });
+      return { ok: true, payload, verified: true };
+    } catch (err) {
+      log('error', `REST flags/config error: ${err?.message || err}`);
+      return { ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  /**
+   * Flip one hex nibble on the last signed payload and re-apply — expect reject.
+   *
+   * @returns {{ ok: boolean, rejected?: boolean, reason?: string, error?: string }}
+   */
+  const proveBadSignature = () => {
+    if (!configRuntime) {
+      return { ok: false, error: 'Config-sync mode required' };
+    }
+    if (!lastSignedConfig?.payload) {
+      return { ok: false, error: 'No signed payload yet — connect and wait for lease/fullConfig/delta' };
+    }
+    if (!configRuntime.store.getMacKey()) {
+      return { ok: false, error: 'No session MAC key (reconnect in config mode)' };
+    }
+    const { eventName, payload } = lastSignedConfig;
+    const originalSig = typeof payload.signature === 'string' ? payload.signature : '';
+    if (originalSig.length < 2) {
+      return { ok: false, error: 'Last payload has no signature to tamper' };
+    }
+    const flipped = (originalSig[0] === '0' ? '1' : '0') + originalSig.slice(1);
+    const tampered = { ...payload, signature: flipped };
+    const result = configRuntime.applySignedEvent(eventName, tampered, currentContext || {});
+    if (result.ok) {
+      log('error', 'Tamper demo FAILED — bad signature was accepted', { eventName });
+      emitConfigPatch(eventName, tampered, { ok: true });
+      return { ok: false, error: 'Unexpected: tampered signature was accepted' };
+    }
+    log('info', 'Tamper demo OK — bad signature rejected', { eventName, reason: result.reason });
+    emitConfigPatch(eventName, tampered, { ok: false, reason: result.reason || 'bad_signature' });
+    return { ok: true, rejected: true, reason: result.reason || 'bad_signature' };
+  };
+
   const disconnect = () => {
     destroyed = true;
     clearLeaseRenewInFlight();
     clearTimers();
     closeEventSource();
     connectionId = null;
+    lastSignedConfig = null;
     configRuntime?.clearMacKey();
 
     if (ws) {
@@ -883,5 +1048,14 @@ export function createFlagmintConnection({
     log('info', 'Disconnected');
   };
 
-  return { connect, sendContext, requestFlag, disconnect, ensureConfigSyncLeaseFresh };
+  return {
+    connect,
+    sendContext,
+    requestFlag,
+    disconnect,
+    ensureConfigSyncLeaseFresh,
+    sendTrackEvent,
+    fetchRestConfig,
+    proveBadSignature,
+  };
 }

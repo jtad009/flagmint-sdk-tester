@@ -5,6 +5,7 @@ import { ENVIRONMENTS, getEnvironment, inferEnvironmentId } from './environments
 import { Tooltip } from './Tooltip';
 import { HowToUsePanel } from './HowToUsePanel';
 import { CollapsibleSection } from './CollapsibleSection';
+import { ToolsPanel } from './ToolsPanel';
 import { FONT, makeStyles, themes } from './uiTheme';
 import {
   clearLocalConfigCache,
@@ -197,6 +198,12 @@ export default function App() {
   const [syncMode, setSyncMode] = useState(() => localStorage.getItem('fm_tester_sync_mode') || 'legacy');
   const [leaseInfo, setLeaseInfo] = useState(null);
   const [configMeta, setConfigMeta] = useState(null);
+  const [lastPatch, setLastPatch] = useState(null);
+  const [trackKind, setTrackKind] = useState('custom');
+  const [trackFlagKey, setTrackFlagKey] = useState('');
+  const [trackEventName, setTrackEventName] = useState('goal_clicked');
+  const [restSinceVersion, setRestSinceVersion] = useState('');
+  const [restResult, setRestResult] = useState(null);
   const [qaBusy, setQaBusy] = useState(false);
   /** Bumps when the mirrored QA client clock changes so lease UI re-renders. */
   const [qaClockEpoch, setQaClockEpoch] = useState(0);
@@ -300,6 +307,8 @@ export default function App() {
     setLogs([]);
     setLeaseInfo(null);
     setConfigMeta(null);
+    setLastPatch(null);
+    setRestResult(null);
 
     const cache = loadLocalConfigCache(apiKey);
     const conn = createFlagmintConnection({
@@ -311,6 +320,7 @@ export default function App() {
       onFlags: setFlags,
       onState: setConnState,
       onLog: addLog,
+      onConfigPatch: setLastPatch,
       initialRulesSnapshot:
         syncMode === 'config' && cache && !isLocalLeaseExpired(cache) ? cache : undefined,
       getSinceVersion: () => {
@@ -429,6 +439,73 @@ export default function App() {
     },
     [context, addLog],
   );
+
+  const handleSendTrack = useCallback(async () => {
+    const conn = connRef.current;
+    if (!conn?.sendTrackEvent) {
+      addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Connect first to send track events' });
+      return;
+    }
+    const result = await conn.sendTrackEvent({
+      kind: trackKind,
+      flagKey: trackFlagKey,
+      eventName: trackKind === 'custom' ? trackEventName : undefined,
+      variationValue: Object.prototype.hasOwnProperty.call(flags, trackFlagKey)
+        ? flags[trackFlagKey]
+        : undefined,
+    });
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'error',
+      msg: result.ok ? `Track ${trackKind} sent` : `Track ${trackKind} failed`,
+      data: result,
+    });
+  }, [trackKind, trackFlagKey, trackEventName, flags, addLog]);
+
+  const handleFetchRestConfig = useCallback(async () => {
+    const helper = createFlagmintConnection({
+      url: apiUrl,
+      streamUrl,
+      apiKey,
+      transport: 'sse',
+      syncMode: 'config',
+      onFlags: () => {},
+      onState: () => {},
+      onLog: addLog,
+      onConfigPatch: setLastPatch,
+    });
+    const sinceRaw = restSinceVersion.trim();
+    const since = sinceRaw === '' ? undefined : Number(sinceRaw);
+    const result = await helper.fetchRestConfig(Number.isInteger(since) ? since : undefined);
+    helper.disconnect();
+    setRestResult(result);
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'warn',
+      msg: 'REST flags/config',
+      data: result,
+    });
+  }, [apiUrl, streamUrl, apiKey, restSinceVersion, addLog]);
+
+  const handleProveTamper = useCallback(() => {
+    const result = connRef.current?.proveBadSignature?.();
+    if (!result) {
+      addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Connect in config-sync mode first' });
+      return;
+    }
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'error',
+      msg: result.ok ? 'Tamper demo: bad signature rejected' : `Tamper demo: ${result.error}`,
+      data: result,
+    });
+  }, [addLog]);
+
+  // Prefill track flag from live flags
+  useEffect(() => {
+    const keys = Object.keys(flags);
+    if (!trackFlagKey && keys.length > 0) setTrackFlagKey(keys[0]);
+  }, [flags, trackFlagKey]);
 
   // Cleanup on unmount
   useEffect(() => () => connRef.current?.disconnect(), []);
@@ -891,7 +968,11 @@ export default function App() {
 
           {/* Tabs */}
           <div style={{ display: 'flex', borderBottom: `1px solid ${t.border}`, background: t.panel, padding: '0 16px', flexShrink: 0 }}>
-            {[['flags', `Flags (${flagCount})`, 'Live flag values from the stream (or last poll).'], ['log', `Log (${logs.length})`, 'Connection, handshake, QA, and eval event log.']].map(([key, label, tip]) => (
+            {[
+              ['flags', `Flags (${flagCount})`, 'Live flag values from the stream (or last poll).'],
+              ['log', `Log (${logs.length})`, 'Connection, handshake, QA, and eval event log.'],
+              ['tools', 'Tools', 'Patch inspection, track events, same-version check, tamper demo, coverage.'],
+            ].map(([key, label, tip]) => (
               <Tooltip key={key} content={tip} position="bottom" multiline>
                 <button
                   type="button"
@@ -1062,6 +1143,30 @@ export default function App() {
                 </div>
               )}
             </div>
+          )}
+
+          {activeTab === 'tools' && (
+            <ToolsPanel
+              theme={t}
+              styles={S}
+              lastPatch={lastPatch}
+              syncMode={syncMode}
+              isConnected={isConnected}
+              apiKey={apiKey}
+              flagKeys={Object.keys(flags)}
+              trackFlagKey={trackFlagKey}
+              setTrackFlagKey={setTrackFlagKey}
+              trackEventName={trackEventName}
+              setTrackEventName={setTrackEventName}
+              trackKind={trackKind}
+              setTrackKind={setTrackKind}
+              onSendTrack={handleSendTrack}
+              restSinceVersion={restSinceVersion}
+              setRestSinceVersion={setRestSinceVersion}
+              onFetchRestConfig={handleFetchRestConfig}
+              onProveTamper={handleProveTamper}
+              restResult={restResult}
+            />
           )}
         </main>
       </div>

@@ -23,7 +23,11 @@ const STEPS = [
     body: 'Clock / +25h / Reset move the server and tester clocks together so leases expire without waiting a day. Status shows plain English by default; open “Show technical details” for cache version / lease ISO. Server state / Clear / Replay manage compiled rules. Clear localCache drops browser rules so the next connect asks for a full copy.',
   },
   {
-    title: '6. Read the log',
+    title: '6. Tools tab',
+    body: 'Live patch inspection (upserts/deletes/segments), send custom/error track events, same-version lease check, and a bad-signature tamper demo. Coverage notes explain wire protocol vs real FlagClient.',
+  },
+  {
+    title: '7. Read the log',
     body: 'Handshake, stream host, lease, deltas, and errors show in the Log tab. Use Evaluate on a flag key to prove local call-site eval in config mode.',
   },
 ];
