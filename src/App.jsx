@@ -7,6 +7,7 @@ import { HowToUsePanel } from './HowToUsePanel';
 import { FONT, makeStyles, themes } from './uiTheme';
 import {
   clearLocalConfigCache,
+  getQaClientClockState,
   isLocalLeaseExpired,
   loadLocalConfigCache,
   qaAdvanceClock,
@@ -15,7 +16,9 @@ import {
   qaGetState,
   qaReplayCompile,
   qaResetClock,
+  resetQaClientClock,
   saveLocalConfigCache,
+  syncQaClientClock,
 } from './qa';
 
 // Styles come from makeStyles(theme) inside App.
@@ -24,20 +27,23 @@ const QA_ACTIONS = [
   {
     id: 'clock',
     label: 'Clock',
-    tip: 'Read the server QA clock offset. Shows whether lease time is shifted for testing.',
+    tip: 'Read the server QA clock and mirror its offset onto the tester lease timer.',
     run: (apiUrl, apiKey) => ['clock', () => qaGetClock(apiUrl, apiKey)],
+    syncsClientClock: true,
   },
   {
     id: 'plus25h',
     label: '+25h',
-    tip: 'Advance the QA clock by 25 hours so leases look expired without waiting a day.',
+    tip: 'Advance server + tester QA clocks by 25 hours so leases expire without waiting a day.',
     run: (apiUrl, apiKey) => ['+25h', () => qaAdvanceClock(apiUrl, apiKey, { hours: 25 })],
+    syncsClientClock: true,
   },
   {
     id: 'reset',
     label: 'Reset clock',
-    tip: 'Clear the QA clock offset and return to real wall time.',
+    tip: 'Clear server and tester QA clock offsets and return to real wall time.',
     run: (apiUrl, apiKey) => ['reset clock', () => qaResetClock(apiUrl, apiKey)],
+    syncsClientClock: true,
   },
   {
     id: 'state',
@@ -127,6 +133,8 @@ export default function App() {
   const [leaseInfo, setLeaseInfo] = useState(null);
   const [configMeta, setConfigMeta] = useState(null);
   const [qaBusy, setQaBusy] = useState(false);
+  /** Bumps when the mirrored QA client clock changes so lease UI re-renders. */
+  const [qaClockEpoch, setQaClockEpoch] = useState(0);
 
   // State
   const [connState, setConnState] = useState(CONNECTION_STATES.DISCONNECTED);
@@ -272,12 +280,35 @@ export default function App() {
     conn.connect(context);
   }, [apiUrl, streamUrl, apiKey, transport, syncMode, context, addLog]);
 
-  const runQa = useCallback(async (label, fn) => {
+  const runQa = useCallback(async (label, fn, { syncsClientClock = false } = {}) => {
     if (!apiKey) return;
     setQaBusy(true);
     try {
       const data = await fn();
       addLog({ ts: new Date().toISOString(), level: 'info', msg: `QA ${label}`, data });
+
+      if (syncsClientClock) {
+        const clientClock =
+          label === 'reset clock'
+            ? resetQaClientClock()
+            : syncQaClientClock(data && typeof data === 'object' ? data : null);
+        setQaClockEpoch((n) => n + 1);
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'info',
+          msg: 'QA client clock mirrored for lease checks',
+          data: clientClock,
+        });
+        const leaseStillFresh = connRef.current?.ensureConfigSyncLeaseFresh?.();
+        if (leaseStillFresh === false) {
+          addLog({
+            ts: new Date().toISOString(),
+            level: 'warn',
+            msg: 'Lease past QA client now — fail-closed + reconnecting for fullConfig',
+          });
+        }
+      }
+
       return data;
     } catch (err) {
       addLog({ ts: new Date().toISOString(), level: 'error', msg: `QA ${label} failed: ${err.message}` });
@@ -308,11 +339,10 @@ export default function App() {
         });
         return;
       }
-      if (result.legacy) {
-        return;
-      }
       // Update only the requested flag so other cards' history stays put.
-      setFlags((prev) => ({ ...prev, [key]: result.value }));
+      if (Object.prototype.hasOwnProperty.call(result, 'value')) {
+        setFlags((prev) => ({ ...prev, [key]: result.value }));
+      }
     },
     [context, addLog],
   );
@@ -535,15 +565,27 @@ export default function App() {
             {syncMode === 'config' && (
               <div style={{ marginTop: 10, fontSize: 11, color: t.muted, lineHeight: 1.45 }}>
                 {(() => {
+                  void qaClockEpoch;
                   const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
-                  const expired = !cache || isLocalLeaseExpired(cache);
+                  const leaseExpiresAt = leaseInfo?.expiresAt ?? cache?.expiresAt;
+                  const expired = !leaseExpiresAt || isLocalLeaseExpired({ expiresAt: leaseExpiresAt });
+                  const clientClock = getQaClientClockState();
                   return (
                     <>
                       <div>localCache: {cache ? `v${cache.version}` : 'empty'}{expired ? ' (expired/missing → fullConfig)' : ' → sinceVersion'}</div>
-                      <div style={{ marginTop: 4 }}>SSE + ECDH MAC verify → local eval (not defaults-only)</div>
+                      <div style={{ marginTop: 4 }}>
+                        {expired
+                          ? 'lease expired (QA client clock) → fail-closed defaults + reconnect'
+                          : 'SSE + ECDH MAC verify → local eval (not defaults-only)'}
+                      </div>
                       {leaseInfo && (
                         <div style={{ color: t.accentSoft, marginTop: 4 }}>
                           lease exp {new Date(leaseInfo.expiresAt).toISOString()}
+                        </div>
+                      )}
+                      {clientClock.offsetMs !== 0 && (
+                        <div style={{ marginTop: 4, color: '#F59E0B' }}>
+                          QA client now {clientClock.effectiveNowIso} (offset {Math.round(clientClock.offsetMs / 3600000)}h)
                         </div>
                       )}
                       {configMeta && (
@@ -580,7 +622,7 @@ export default function App() {
                       }}
                       onClick={() => {
                         const [label, fn] = action.run(apiUrl, apiKey);
-                        runQa(label, fn);
+                        runQa(label, fn, { syncsClientClock: !!action.syncsClientClock });
                       }}
                     >
                       {action.label}

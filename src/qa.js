@@ -1,7 +1,64 @@
 /**
  * QA helpers for config-sync clock / clear / replay.
  * Speaks FF-EU /evaluator/v2/qa/config-sync/* with x-api-key.
+ *
+ * Client-side lease checks use {@link qaClientNowMs} so advancing the server
+ * QA clock also advances the tester's expiry timer (production SDK stays on
+ * real wall time).
  */
+
+/** Offset applied on top of `Date.now()` for tester lease / cache expiry. */
+let clientOffsetMs = 0;
+
+/**
+ * Snapshot of the tester's mirrored QA clock.
+ *
+ * @returns {{ wallClockMs: number, offsetMs: number, effectiveNowMs: number, effectiveNowIso: string }}
+ */
+export function getQaClientClockState() {
+  const wallClockMs = Date.now();
+  const effectiveNowMs = wallClockMs + clientOffsetMs;
+  return {
+    wallClockMs,
+    offsetMs: clientOffsetMs,
+    effectiveNowMs,
+    effectiveNowIso: new Date(effectiveNowMs).toISOString(),
+  };
+}
+
+/**
+ * Tester "now" for lease readiness (wall clock + last synced QA offset).
+ *
+ * @returns {number} Epoch ms
+ */
+export function qaClientNowMs() {
+  return Date.now() + clientOffsetMs;
+}
+
+/**
+ * Mirror a server QA clock response onto the tester's client timer.
+ *
+ * @param {{ offsetMs?: number, effectiveNowMs?: number }|null|undefined} clock
+ * @returns {ReturnType<typeof getQaClientClockState>}
+ */
+export function syncQaClientClock(clock) {
+  if (clock && typeof clock.offsetMs === 'number' && Number.isFinite(clock.offsetMs)) {
+    clientOffsetMs = clock.offsetMs;
+  } else if (clock && typeof clock.effectiveNowMs === 'number' && Number.isFinite(clock.effectiveNowMs)) {
+    clientOffsetMs = clock.effectiveNowMs - Date.now();
+  }
+  return getQaClientClockState();
+}
+
+/**
+ * Clear the tester QA offset (real wall time again).
+ *
+ * @returns {ReturnType<typeof getQaClientClockState>}
+ */
+export function resetQaClientClock() {
+  clientOffsetMs = 0;
+  return getQaClientClockState();
+}
 
 function trimSlash(url) {
   return String(url || '').replace(/\/+$/, '');
@@ -83,8 +140,15 @@ export function clearLocalConfigCache(apiKey) {
   localStorage.removeItem(CACHE_PREFIX + apiKey);
 }
 
-/** Fail-closed helper for the tester UI. */
-export function isLocalLeaseExpired(cache, nowMs = Date.now()) {
+/**
+ * Fail-closed helper for the tester UI / connect decisions.
+ * Defaults to the mirrored QA clock when an offset is set.
+ *
+ * @param {{ expiresAt?: number }|null|undefined} cache
+ * @param {number} [nowMs=qaClientNowMs()]
+ * @returns {boolean}
+ */
+export function isLocalLeaseExpired(cache, nowMs = qaClientNowMs()) {
   if (!cache || typeof cache.expiresAt !== 'number') return true;
   return nowMs >= cache.expiresAt;
 }

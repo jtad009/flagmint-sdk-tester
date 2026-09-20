@@ -244,8 +244,16 @@ export class RulesStore {
     return !isConfigPayloadExpired(this.state.expiresAt, now);
   }
 
+  /**
+   * Mark the store fail-closed after wall-clock lease expiry.
+   * Next reconnect must request fullConfig (or a fresh lease + catch-up).
+   */
   markExpired(): void {
-    this.state = { ...cloneState(this.state), ready: false };
+    this.state = {
+      ...cloneState(this.state),
+      ready: false,
+      needsFullConfig: true,
+    };
   }
 
   getFlag(key: string): SdkFlagConfig | undefined {

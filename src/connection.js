@@ -16,6 +16,7 @@
 
 import { performAslHandshake } from '@flagmint/config-sync';
 import { createConfigSyncRuntime } from './configSyncRuntime';
+import { qaClientNowMs } from './qa';
 
 export const CONNECTION_STATES = {
   DISCONNECTED: 'disconnected',
@@ -136,16 +137,111 @@ export function createFlagmintConnection({
   let connectionId = null;
   let reconnectAttempts = 0;
   let sawConnected = false;
+  /** Avoid stacking reconnects when many Evaluate clicks hit an expired lease. */
+  let leaseRenewInFlight = false;
+  /** Last evaluated flag map (legacy stream / local eval). */
+  let lastFlags = {};
+  /** Analytics map from SSE `flags` packets; null until received. */
+  let analyticsByFlag = null;
 
   const log = (level, msg, data) => {
     onLog?.({ ts: new Date().toISOString(), level, msg, data });
   };
 
+  /**
+   * Push a flag map to the UI and remember it for legacy call-site Evaluate.
+   *
+   * @param {Record<string, unknown>} flags Evaluated key → value map
+   * @param {string} [source] Log label (e.g. `SSE flags event`)
+   * @returns {void}
+   */
   const applyFlags = (flags, source) => {
     const map = flags && typeof flags === 'object' && !Array.isArray(flags) ? flags : {};
+    lastFlags = { ...map };
     const count = Object.keys(map).length;
     log('info', `Received ${count} flag${count !== 1 ? 's' : ''}${source ? ` (${source})` : ''}`, { flags: map });
     onFlags(map);
+  };
+
+  /**
+   * Resolve the visitor id used in evaluation reports from evaluation context.
+   * Prefers `user.key`, then `userKey`, then top-level `key`.
+   *
+   * @param {Record<string, unknown>|null|undefined} ctx
+   * @returns {string|undefined}
+   */
+  const userKeyFromContext = (ctx) => {
+    if (!ctx || typeof ctx !== 'object') return undefined;
+    const user = ctx.user;
+    if (user && typeof user === 'object' && !Array.isArray(user) && typeof user.key === 'string' && user.key) {
+      return user.key;
+    }
+    if (typeof ctx.userKey === 'string' && ctx.userKey) return ctx.userKey;
+    if (typeof ctx.key === 'string' && ctx.key) return ctx.key;
+    return undefined;
+  };
+
+  /**
+   * Whether call-site analytics should be reported for this flag key.
+   * Config-sync reads `analytics_enabled` from RulesStore; legacy uses the SSE analytics map
+   * (or allows and lets the server drop when the map has not arrived yet).
+   *
+   * @param {string} key Flag key
+   * @returns {boolean}
+   */
+  const isAnalyticsOn = (key) => {
+    if (configRuntime) {
+      const flag = configRuntime.getState().flags.get(key);
+      return flag?.analytics_enabled === true;
+    }
+    if (analyticsByFlag === null) return true;
+    return analyticsByFlag[key] === true;
+  };
+
+  /**
+   * POST a call-site evaluation event for the Evaluations dashboard card.
+   * Fire-and-forget; never throws to the caller. Skips when analytics is off for the flag.
+   * Caller must ensure lease freshness before evaluating / choosing variationValue.
+   *
+   * @param {string} flagKey
+   * @param {unknown} variationValue Served value for variation breakdown
+   * @param {Record<string, unknown>} ctx Current evaluation context
+   * @returns {void}
+   */
+  const reportCallSiteEvaluation = (flagKey, variationValue, ctx) => {
+    if (!isAnalyticsOn(flagKey)) {
+      log('debug', `getFlag(${flagKey}) skipped evaluation report (analytics off)`);
+      return;
+    }
+    const body = {
+      events: [{
+        flagKey,
+        kind: 'evaluation',
+        variationValue,
+        userKey: userKeyFromContext(ctx),
+        count: 1,
+        timestamp: new Date().toISOString(),
+      }],
+    };
+    void fetch(`${apiBaseUrl}/evaluator/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+      },
+      body: JSON.stringify(body),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          log('warn', `Evaluation report failed (${res.status})`, { flagKey, body: text.slice(0, 200) });
+          return;
+        }
+        log('info', `Evaluation reported for ${flagKey}`, { flagKey, variationValue });
+      })
+      .catch((err) => {
+        log('warn', `Evaluation report network error: ${err?.message || err}`, { flagKey });
+      });
   };
 
   const publishLocalEval = (source) => {
@@ -193,6 +289,7 @@ export function createFlagmintConnection({
     else onConfig?.(payload);
 
     onRulesSnapshot?.(result.snapshot);
+    leaseRenewInFlight = false;
 
     // Lease alone may not change flags; still re-eval when we have rules.
     if (result.state.flags.size > 0 && !result.state.needsFullConfig) {
@@ -270,9 +367,10 @@ export function createFlagmintConnection({
     });
 
     if (syncMode === 'config') {
+      const now = qaClientNowMs();
       const since = typeof getSinceVersion === 'function' ? getSinceVersion() : undefined;
       const hasSince = Number.isInteger(since);
-      const storeWantsFull = configRuntime?.store?.wantsFullConfig?.() === true;
+      const storeWantsFull = configRuntime?.store?.wantsFullConfig?.(now) === true;
       const wantFull =
         storeWantsFull ||
         (typeof forceFullConfig === 'function' && forceFullConfig()) ||
@@ -382,6 +480,9 @@ export function createFlagmintConnection({
         log('warn', 'Ignoring flags event without a flags object', { raw: event.data });
         return;
       }
+      if (payload.analytics && typeof payload.analytics === 'object' && !Array.isArray(payload.analytics)) {
+        analyticsByFlag = payload.analytics;
+      }
       applyFlags(payload.flags, 'SSE flags event');
     });
 
@@ -452,6 +553,36 @@ export function createFlagmintConnection({
     }, delay);
   };
 
+  /**
+   * If config-sync lease is past expiresAt (tester QA clock): fail-closed,
+   * force fullConfig reconnect.
+   *
+   * @returns {boolean} True when the lease is still valid
+   */
+  const ensureConfigSyncLeaseFresh = () => {
+    if (syncMode !== 'config' || !configRuntime) return true;
+    const now = qaClientNowMs();
+    if (configRuntime.isLeaseReady(now)) {
+      leaseRenewInFlight = false;
+      return true;
+    }
+    configRuntime.markLeaseExpired();
+    onRulesSnapshot?.(configRuntime.getSnapshot());
+    if (!leaseRenewInFlight && transport === 'sse' && !destroyed) {
+      leaseRenewInFlight = true;
+      log('warn', 'Config-sync lease expired — fail-closed to defaults; reconnecting for fullConfig', {
+        now: new Date(now).toISOString(),
+        expiresAt: configRuntime.getState().expiresAt
+          ? new Date(configRuntime.getState().expiresAt).toISOString()
+          : null,
+      });
+      closeEventSource();
+      connectionId = null;
+      scheduleSseReconnect();
+    }
+    return false;
+  };
+
   const connectSSE = async (context) => {
     if (destroyed) return;
     closeEventSource();
@@ -468,8 +599,9 @@ export function createFlagmintConnection({
   };
 
   const sendContextSSE = async (context) => {
-    // Config-sync: re-evaluate locally even if the stream is mid-reconnect.
+    // Config-sync: renew lease stream if expired, then re-evaluate (defaults if fail-closed).
     if (syncMode === 'config' && configRuntime) {
+      ensureConfigSyncLeaseFresh();
       publishLocalEval('local eval after context');
       if (!connectionId) {
         log('warn', 'Context evaluated locally — SSE not connected yet; skipping telemetry POST.');
@@ -669,30 +801,48 @@ export function createFlagmintConnection({
 
   /**
    * Call-site style request for one flag using the given (sidebar) context.
-   * Config-sync: local evaluateSdkFlag. Legacy: returns last streamed value only.
+   * Config-sync: local evaluateSdkFlag. Legacy: returns last streamed value.
+   * Both paths POST kind=evaluation when analytics is on for that flag.
+   * Expired lease → fail-closed default + reconnect (still returns a value).
    */
   const requestFlag = (key, context) => {
     const ctx = context ?? currentContext ?? {};
     currentContext = ctx;
 
     if (syncMode === 'config' && configRuntime) {
+      const leaseOk = ensureConfigSyncLeaseFresh();
+      if (!leaseOk) {
+        const value = configRuntime.failClosedDefault(key);
+        lastFlags = { ...lastFlags, [key]: value };
+        log('warn', `getFlag(${key}) lease expired — fail-closed default`, {
+          key,
+          value,
+          context: ctx,
+        });
+        reportCallSiteEvaluation(key, value, ctx);
+        return { ok: true, value, key, leaseExpired: true };
+      }
       const result = configRuntime.evaluateFlag(key, ctx);
       if (!result.ok) {
         log('warn', `getFlag(${key}) failed: ${result.reason}`, { key, reason: result.reason, context: ctx });
         return { ok: false, reason: result.reason };
       }
+      lastFlags = { ...lastFlags, [key]: result.value };
       log('info', `getFlag(${key}) local eval`, { key, value: result.value, context: ctx });
-      // Only this flag — do not re-run the full matrix (that polluted other flags' history).
+      reportCallSiteEvaluation(key, result.value, ctx);
       return { ok: true, value: result.value, key };
     }
 
-    // Legacy: no local rules — surface last known streamed value for this key.
+    const value = Object.prototype.hasOwnProperty.call(lastFlags, key)
+      ? lastFlags[key]
+      : undefined;
     log('info', `getFlag(${key}) legacy (last server-evaluated snapshot)`, {
       key,
-      note: 'Server matrix eval; call-site analytics not wired yet',
+      value,
       context: ctx,
     });
-    return { ok: true, value: undefined, legacy: true };
+    reportCallSiteEvaluation(key, value, ctx);
+    return { ok: true, value, key, legacy: true };
   };
 
   const disconnect = () => {
@@ -711,5 +861,5 @@ export function createFlagmintConnection({
     log('info', 'Disconnected');
   };
 
-  return { connect, sendContext, requestFlag, disconnect };
+  return { connect, sendContext, requestFlag, disconnect, ensureConfigSyncLeaseFresh };
 }

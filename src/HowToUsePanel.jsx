@@ -20,7 +20,7 @@ const STEPS = [
   },
   {
     title: '5. QA clock / data (staging)',
-    body: 'Clock / +25h / Reset exercise lease expiry. Server state / Clear / Replay manage compiled rules on the API. Clear localCache drops browser rules so the next connect asks for fullConfig.',
+    body: 'Clock / +25h / Reset move the server QA clock and mirror the same offset onto the tester lease timer (so getFlag fail-closes + reconnects without waiting 24h). Server state / Clear / Replay manage compiled rules. Clear localCache drops browser rules so the next connect asks for fullConfig.',
   },
   {
     title: '6. Read the log',
