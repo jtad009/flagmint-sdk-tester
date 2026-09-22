@@ -1,20 +1,72 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createFlagmintConnection, CONNECTION_STATES } from './connection';
+import { createConfigSyncRuntime } from './configSyncRuntime';
 import { buildContextFromFields, CONTEXT_PRESETS, flagTypeLabel, flagValueDisplay, flagValueShort, TYPE_COLORS, logColor } from './helpers';
+import { ENVIRONMENTS, getEnvironment, inferEnvironmentId } from './environments';
+import { Tooltip } from './Tooltip';
+import { HowToUsePanel } from './HowToUsePanel';
+import { CollapsibleSection } from './CollapsibleSection';
+import { ToolsPanel } from './ToolsPanel';
+import { FONT, makeStyles, themes } from './uiTheme';
+import {
+  clearLocalConfigCache,
+  getQaClientClockState,
+  isLocalLeaseExpired,
+  loadLocalConfigCache,
+  qaAdvanceClock,
+  qaClearConfig,
+  qaGetClock,
+  qaGetState,
+  qaReplayCompile,
+  qaResetClock,
+  resetQaClientClock,
+  saveLocalConfigCache,
+  syncQaClientClock,
+} from './qa';
 
-// ─── Shared Style Constants ─────────────────────────────────────
+// Styles come from makeStyles(theme) inside App.
 
-const PURPLE = '#7C3AED';
-const FONT = "'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace";
-
-const S = {
-  label: { fontSize: 11, fontWeight: 600, color: '#6B7280', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: 4 },
-  input: { width: '100%', padding: '7px 10px', fontSize: 12, background: '#0B0E14', border: '1px solid #1E2533', borderRadius: 4, color: '#E5E7EB', outline: 'none', fontFamily: FONT, boxSizing: 'border-box' },
-  btnPrimary: { padding: '8px 16px', fontSize: 12, fontWeight: 600, borderRadius: 4, border: 'none', background: PURPLE, color: '#fff', cursor: 'pointer', fontFamily: FONT },
-  btnDanger: { padding: '8px 16px', fontSize: 12, fontWeight: 600, borderRadius: 4, border: '1px solid #EF4444', background: '#EF444422', color: '#EF4444', cursor: 'pointer', fontFamily: FONT },
-  btnGhost: { padding: '6px 12px', fontSize: 11, borderRadius: 4, border: '1px solid #2A3040', background: 'transparent', color: '#6B7280', cursor: 'pointer', fontFamily: FONT },
-  preset: { padding: '2px 8px', fontSize: 10, borderRadius: 3, border: '1px solid #2A3040', background: 'transparent', color: '#6B7280', cursor: 'pointer', fontFamily: FONT },
-};
+const QA_ACTIONS = [
+  {
+    id: 'clock',
+    label: 'Clock',
+    tip: 'Read the server QA clock and mirror its offset onto the tester lease timer.',
+    run: (apiUrl, apiKey) => ['clock', () => qaGetClock(apiUrl, apiKey)],
+    syncsClientClock: true,
+  },
+  {
+    id: 'plus25h',
+    label: '+25h',
+    tip: 'Advance server + tester QA clocks by 25 hours so leases expire without waiting a day.',
+    run: (apiUrl, apiKey) => ['+25h', () => qaAdvanceClock(apiUrl, apiKey, { hours: 25 })],
+    syncsClientClock: true,
+  },
+  {
+    id: 'reset',
+    label: 'Reset clock',
+    tip: 'Clear server and tester QA clock offsets and return to real wall time.',
+    run: (apiUrl, apiKey) => ['reset clock', () => qaResetClock(apiUrl, apiKey)],
+    syncsClientClock: true,
+  },
+  {
+    id: 'state',
+    label: 'Server state',
+    tip: 'Show compiled rules version / backlog metadata for this API key’s environment.',
+    run: (apiUrl, apiKey) => ['state', () => qaGetState(apiUrl, apiKey)],
+  },
+  {
+    id: 'clear',
+    label: 'Clear server',
+    tip: 'Delete compiled rules from Redis for this env. Next connect should get config_not_ready until Replay.',
+    run: (apiUrl, apiKey) => ['clear Redis rules', () => qaClearConfig(apiUrl, apiKey)],
+  },
+  {
+    id: 'replay',
+    label: 'Replay',
+    tip: 'Recompile flag rules from the database into Redis (cold-start / after Clear server).',
+    run: (apiUrl, apiKey) => ['replay compile', () => qaReplayCompile(apiUrl, apiKey)],
+  },
+];
 
 const STATE_COLORS = {
   [CONNECTION_STATES.CONNECTED]: '#10B981',
@@ -24,18 +76,184 @@ const STATE_COLORS = {
 };
 
 const TRANSPORTS = [
-  { id: 'sse', label: 'SSE' },
-  { id: 'websocket', label: 'WebSocket' },
-  { id: 'long-polling', label: 'Polling' },
+  { id: 'sse', label: 'SSE', tip: 'ASL handshake + EventSource stream (JS SDK path). Required for config-sync.' },
+  { id: 'websocket', label: 'WebSocket', tip: 'Legacy Go SDK path on the API host (/ws/sdk). Not for config-sync.' },
+  { id: 'long-polling', label: 'Polling', tip: 'Repeated POST /evaluator/evaluate on the API host.' },
 ];
+
+const ENV_TIPS = {
+  local: 'Local FF-EU — API and stream both use localhost:3000.',
+  staging: 'Staging — handshake/QA on staging-api; SSE on staging-stream (CF bypass host).',
+  production: 'Production — handshake/QA on api.flagmint.com; SSE on stream.flagmint.com.',
+  custom: 'Type your own API + Stream hosts (for one-off testing).',
+};
+
+const SYNC_TIPS = {
+  legacy: 'Server-evaluated flags events on the stream (classic path).',
+  config: 'ECDH + signed fullConfig/deltas + local eval. Use SSE transport.',
+};
+
+const PRESET_TIPS = {
+  simple_user: 'Load a simple user context preset (kind + key).',
+  multi_context: 'Load a multi-context preset for targeting tests.',
+  empty: 'Clear context fields to an empty object.',
+};
+
+/**
+ * Whether localCache has a version and at least one flag rule (usable for local eval).
+ *
+ * @param {{ version?: number, flags?: unknown[] }|null|undefined} cache
+ * @returns {boolean}
+ */
+function isLocalRulesCacheComplete(cache) {
+  return (
+    !!cache &&
+    typeof cache.version === 'number' &&
+    Array.isArray(cache.flags)
+  );
+}
+
+/**
+ * Format a lease expiry for non-technical readers.
+ *
+ * @param {number} ms Epoch ms
+ * @returns {string}
+ */
+function formatLeaseWhen(ms) {
+  try {
+    return new Date(ms).toLocaleString(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    });
+  } catch {
+    return new Date(ms).toISOString();
+  }
+}
+
+/**
+ * config-sync status for the sidebar.
+ *
+ * @param {{
+ *   cache: { version?: number, expiresAt?: number, flags?: unknown[] }|null,
+ *   leaseExpiresAt: number|undefined,
+ *   expired: boolean,
+ *   transport: string,
+ *   clientOffsetMs: number,
+ *   isConnected: boolean,
+ * }} input
+ * @returns {{ headline: string, detail: string|null, warn: string|null }}
+ */
+function configSyncPlainStatus({
+  cache,
+  leaseExpiresAt,
+  expired,
+  transport,
+  clientOffsetMs,
+  isConnected,
+}) {
+  if (transport !== 'sse') {
+    return {
+      headline: 'Switch to SSE to use this mode',
+      detail: 'The live rules stream only works with the SSE transport.',
+      warn: null,
+    };
+  }
+  if (!isLocalRulesCacheComplete(cache)) {
+    return {
+      headline: 'No saved rules yet',
+      detail: 'Next connect will download a full copy of the flag rules.',
+      warn: null,
+    };
+  }
+  if (expired) {
+    return {
+      headline: isConnected ? 'Rules expired — renewing' : 'Rules expired',
+      detail: leaseExpiresAt
+        ? isConnected
+          ? `This copy ran out at ${formatLeaseWhen(leaseExpiresAt)}. Safe defaults are used until a fresh copy arrives.`
+          : `This copy ran out at ${formatLeaseWhen(leaseExpiresAt)}. Connect again to download a fresh copy.`
+        : isConnected
+          ? 'Safe defaults are used until a fresh copy of the rules arrives.'
+          : 'Connect again to download a fresh copy of the rules.',
+      warn: clientOffsetMs !== 0 ? 'Test clock is shifted ahead so you can practice expiry without waiting a day.' : null,
+    };
+  }
+  return {
+    headline: 'Flags ready',
+    detail: leaseExpiresAt
+      ? `Checking flags on your device. This copy is good until ${formatLeaseWhen(leaseExpiresAt)}.`
+      : 'Checking flags on your device with a secure live connection.',
+    warn: clientOffsetMs !== 0
+      ? `Test clock is ahead by about ${Math.round(clientOffsetMs / 3600000)} hours (lease testing).`
+      : null,
+  };
+}
+
+function loadInitialUrls() {
+  const storedApi = localStorage.getItem('fm_tester_url') || 'http://localhost:3000';
+  const storedStream = localStorage.getItem('fm_tester_stream_url');
+  const storedEnv = localStorage.getItem('fm_tester_env');
+  const envId =
+    storedEnv && ENVIRONMENTS.some((e) => e.id === storedEnv)
+      ? storedEnv
+      : inferEnvironmentId(storedApi);
+  const preset = getEnvironment(envId);
+  if (envId === 'custom') {
+    return {
+      envId: 'custom',
+      apiUrl: storedApi,
+      streamUrl: storedStream || storedApi,
+    };
+  }
+  return {
+    envId,
+    apiUrl: preset.apiUrl,
+    streamUrl: preset.streamUrl,
+  };
+}
 
 // ─── App ────────────────────────────────────────────────────────
 
 export default function App() {
   // Config
-  const [apiUrl, setApiUrl] = useState(() => localStorage.getItem('fm_tester_url') || 'http://localhost:3000');
+  const initial = loadInitialUrls();
+  const [envId, setEnvId] = useState(initial.envId);
+  const [apiUrl, setApiUrl] = useState(initial.apiUrl);
+  const [streamUrl, setStreamUrl] = useState(initial.streamUrl);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('fm_tester_key') || '');
   const [transport, setTransport] = useState(() => localStorage.getItem('fm_tester_transport') || 'sse');
+  const [syncMode, setSyncMode] = useState(() => localStorage.getItem('fm_tester_sync_mode') || 'legacy');
+  const [leaseInfo, setLeaseInfo] = useState(null);
+  const [configMeta, setConfigMeta] = useState(null);
+  const [lastPatch, setLastPatch] = useState(null);
+  const [trackKind, setTrackKind] = useState('custom');
+  const [trackFlagKey, setTrackFlagKey] = useState('');
+  const [trackEventName, setTrackEventName] = useState('goal_clicked');
+  const [restSinceVersion, setRestSinceVersion] = useState('');
+  const [restResult, setRestResult] = useState(null);
+  /** Only auto-fill flag key once per connect; clearing the field must stay empty. */
+  const didPrefillTrackFlag = useRef(false);
+  const [qaBusy, setQaBusy] = useState(false);
+  /** Bumps when the mirrored QA client clock changes so lease UI re-renders. */
+  const [qaClockEpoch, setQaClockEpoch] = useState(0);
+  /** Collapsed by default so flags / log get more vertical space. */
+  const [openSections, setOpenSections] = useState({
+    connection: false,
+    configSync: false,
+    qa: false,
+    context: false,
+  });
+  /** Collapsed technical dump under the plain-English config-sync status. */
+  const [showConfigSyncDetails, setShowConfigSyncDetails] = useState(false);
+
+  /**
+   * Toggle one sidebar section open/closed.
+   *
+   * @param {'connection'|'configSync'|'qa'|'context'} id
+   */
+  const toggleSection = (id) => {
+    setOpenSections((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
 
   // State
   const [connState, setConnState] = useState(CONNECTION_STATES.DISCONNECTED);
@@ -50,6 +268,11 @@ export default function App() {
   const [filterText, setFilterText] = useState('');
   const [expandedFlags, setExpandedFlags] = useState(new Set());
   const [showDebug, setShowDebug] = useState(false);
+  const [showHowTo, setShowHowTo] = useState(false);
+  const [themeMode, setThemeMode] = useState(() => localStorage.getItem('fm_tester_theme') || 'light');
+  const t = themes[themeMode] || themes.light;
+  const S = makeStyles(t);
+
 
   const connRef = useRef(null);
   const logEndRef = useRef(null);
@@ -58,11 +281,31 @@ export default function App() {
   const isConnected = connState === CONNECTION_STATES.CONNECTED;
   const isConnecting = connState === CONNECTION_STATES.CONNECTING;
   const flagCount = Object.keys(flags).length;
+  /**
+   * Evaluate needs an in-memory flag map, not a live stream.
+   * Disconnect / stream cut keeps flags + RulesStore; only a fresh Connect clears them.
+   */
+  const canEvaluate = flagCount > 0;
+  const isCustomEnv = envId === 'custom';
+  const urlsLocked = isConnected || isConnecting;
+
+  const applyEnvironment = useCallback((nextId) => {
+    setEnvId(nextId);
+    const preset = getEnvironment(nextId);
+    if (nextId === 'custom') return;
+    setApiUrl(preset.apiUrl);
+    setStreamUrl(preset.streamUrl);
+  }, []);
 
   // Persist URL and key
+  useEffect(() => { localStorage.setItem('fm_tester_env', envId); }, [envId]);
   useEffect(() => { localStorage.setItem('fm_tester_url', apiUrl); }, [apiUrl]);
+  useEffect(() => { localStorage.setItem('fm_tester_stream_url', streamUrl); }, [streamUrl]);
   useEffect(() => { localStorage.setItem('fm_tester_key', apiKey); }, [apiKey]);
   useEffect(() => { localStorage.setItem('fm_tester_transport', transport); }, [transport]);
+  useEffect(() => { localStorage.setItem('fm_tester_sync_mode', syncMode); }, [syncMode]);
+  useEffect(() => { localStorage.setItem('fm_tester_theme', themeMode); }, [themeMode]);
+  useEffect(() => { document.body.style.background = t.bg; }, [t.bg]);
 
   // Auto-scroll log
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
@@ -96,25 +339,269 @@ export default function App() {
     setFlags({});
     setFlagHistory({});
     setLogs([]);
+    setLeaseInfo(null);
+    setConfigMeta(null);
+    setLastPatch(null);
+    setRestResult(null);
+    didPrefillTrackFlag.current = false;
 
+    const cache = loadLocalConfigCache(apiKey);
     const conn = createFlagmintConnection({
-      url: apiUrl, apiKey, transport,
+      url: apiUrl,
+      streamUrl,
+      apiKey,
+      transport,
+      syncMode: syncMode === 'config' ? 'config' : 'legacy',
       onFlags: setFlags,
       onState: setConnState,
       onLog: addLog,
+      onConfigPatch: setLastPatch,
+      initialRulesSnapshot:
+        syncMode === 'config' && cache && !isLocalLeaseExpired(cache) && isLocalRulesCacheComplete(cache)
+          ? cache
+          : undefined,
+      getSinceVersion: () => {
+        const c = loadLocalConfigCache(apiKey);
+        if (!c || isLocalLeaseExpired(c) || !isLocalRulesCacheComplete(c)) return undefined;
+        return typeof c.version === 'number' ? c.version : undefined;
+      },
+      forceFullConfig: () => {
+        const c = loadLocalConfigCache(apiKey);
+        return !c || isLocalLeaseExpired(c) || !isLocalRulesCacheComplete(c);
+      },
+      onLease: (lease) => {
+        setLeaseInfo(lease);
+        const prev = loadLocalConfigCache(apiKey) || {};
+        // Version bookmark comes from RulesStore via onRulesSnapshot; lease mainly renews expiry.
+        if (!saveLocalConfigCache(apiKey, {
+          ...prev,
+          expiresAt: lease.expiresAt ?? prev.expiresAt,
+          serverNow: lease.serverNow,
+          signature: lease.signature,
+        })) {
+          addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Failed to persist lease to localCache (storage full or disabled)' });
+        }
+      },
+      onConfig: (payload) => {
+        setConfigMeta({
+          type: payload.type,
+          version: payload.version ?? payload.toVersion,
+          warnings: payload.warnings,
+          fromVersion: payload.fromVersion,
+          toVersion: payload.toVersion,
+        });
+      },
+      onRulesSnapshot: (snapshot) => {
+        const prev = loadLocalConfigCache(apiKey) || {};
+        if (!saveLocalConfigCache(apiKey, {
+          ...prev,
+          version: snapshot.version,
+          expiresAt: snapshot.expiresAt ?? prev.expiresAt,
+          flags: snapshot.flags,
+          segments: snapshot.segments,
+          updatedAt: new Date().toISOString(),
+          lastPayloadType: 'rulesSnapshot',
+        })) {
+          addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Failed to persist rules snapshot to localCache (storage full or disabled)' });
+        }
+      },
     });
     connRef.current = conn;
     conn.connect(context);
-  }, [apiUrl, apiKey, transport, context, addLog]);
+  }, [apiUrl, streamUrl, apiKey, transport, syncMode, context, addLog]);
+
+  const runQa = useCallback(async (label, fn, { syncsClientClock = false } = {}) => {
+    if (!apiKey) return;
+    setQaBusy(true);
+    try {
+      const data = await fn();
+      addLog({ ts: new Date().toISOString(), level: 'info', msg: `QA ${label}`, data });
+
+      if (syncsClientClock) {
+        const clientClock =
+          label === 'reset clock'
+            ? resetQaClientClock()
+            : syncQaClientClock(data && typeof data === 'object' ? data : null);
+        setQaClockEpoch((n) => n + 1);
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'info',
+          msg: 'QA client clock mirrored for lease checks',
+          data: clientClock,
+        });
+        const leaseStillFresh = connRef.current?.ensureConfigSyncLeaseFresh?.();
+        if (leaseStillFresh === false) {
+          addLog({
+            ts: new Date().toISOString(),
+            level: 'warn',
+            msg: 'Lease past QA client now — fail-closed + reconnecting for fullConfig',
+          });
+        }
+      }
+
+      return data;
+    } catch (err) {
+      addLog({ ts: new Date().toISOString(), level: 'error', msg: `QA ${label} failed: ${err.message}` });
+    } finally {
+      setQaBusy(false);
+    }
+  }, [apiKey, addLog]);
 
   const handleDisconnect = useCallback(() => {
+    // Keep connRef so offline Evaluate can still call requestFlag (RulesStore stays in memory).
     connRef.current?.disconnect();
-    connRef.current = null;
   }, []);
+
+  /**
+   * Offline config-sync getFlag from localCache when the live session was cleared.
+   *
+   * @param {string} key
+   * @param {Record<string, unknown>} ctx
+   * @returns {{ ok: boolean, value?: unknown, reason?: string, leaseExpired?: boolean, offlineCache?: boolean }}
+   */
+  const evaluateFlagFromLocalCache = useCallback((key, ctx) => {
+    const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+    if (!isLocalRulesCacheComplete(cache)) {
+      return { ok: false, reason: 'no_rules_cache' };
+    }
+    const runtime = createConfigSyncRuntime();
+    runtime.hydrateFromCache(cache);
+    if (!runtime.isLeaseReady()) {
+      const value = runtime.failClosedDefault(key);
+      return { ok: true, value, key, leaseExpired: true, offlineCache: true };
+    }
+    const result = runtime.evaluateFlag(key, ctx);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason, offlineCache: true };
+    }
+    return { ok: true, value: result.value, key, offlineCache: true };
+  }, [apiKey]);
 
   const handleSendContext = useCallback(() => {
     connRef.current?.sendContext(context);
   }, [context]);
+
+  const handleRequestFlag = useCallback(
+    (key) => {
+      let result = connRef.current?.requestFlag?.(key, context);
+
+      if (!result && syncMode === 'config') {
+        result = evaluateFlagFromLocalCache(key, context);
+        if (result.ok) {
+          addLog({
+            ts: new Date().toISOString(),
+            level: result.leaseExpired ? 'warn' : 'info',
+            msg: result.leaseExpired
+              ? `getFlag(${key}) offline cache — lease expired, fail-closed default`
+              : `getFlag(${key}) offline cache local eval`,
+            data: result,
+          });
+        }
+      } else if (!result && syncMode === 'legacy') {
+        const value = Object.prototype.hasOwnProperty.call(flags, key) ? flags[key] : undefined;
+        result = { ok: true, value, key, legacy: true, offline: true };
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'info',
+          msg: `getFlag(${key}) offline — last streamed snapshot`,
+          data: result,
+        });
+      }
+
+      if (!result) {
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'warn',
+          msg: `getFlag(${key}) skipped — no session and no usable localCache`,
+        });
+        return;
+      }
+      if (result.ok === false) {
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'warn',
+          msg: `getFlag(${key}) failed: ${result.reason}`,
+          data: result,
+        });
+        return;
+      }
+      // Update only the requested flag so other cards' history stays put.
+      if (Object.prototype.hasOwnProperty.call(result, 'value')) {
+        setFlags((prev) => ({ ...prev, [key]: result.value }));
+      }
+    },
+    [context, addLog, syncMode, flags, evaluateFlagFromLocalCache],
+  );
+
+  const handleSendTrack = useCallback(async () => {
+    const conn = connRef.current;
+    if (!conn?.sendTrackEvent) {
+      addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Connect first to send track events' });
+      return;
+    }
+    const result = await conn.sendTrackEvent({
+      kind: trackKind,
+      flagKey: trackFlagKey,
+      eventName: trackKind === 'custom' ? trackEventName : undefined,
+      variationValue: Object.prototype.hasOwnProperty.call(flags, trackFlagKey)
+        ? flags[trackFlagKey]
+        : undefined,
+    });
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'error',
+      msg: result.ok ? `Track ${trackKind} sent` : `Track ${trackKind} failed`,
+      data: result,
+    });
+  }, [trackKind, trackFlagKey, trackEventName, flags, addLog]);
+
+  const handleFetchRestConfig = useCallback(async () => {
+    const helper = createFlagmintConnection({
+      url: apiUrl,
+      streamUrl,
+      apiKey,
+      transport: 'sse',
+      syncMode: 'config',
+      onFlags: () => {},
+      onState: () => {},
+      onLog: addLog,
+      onConfigPatch: setLastPatch,
+    });
+    const sinceRaw = restSinceVersion.trim();
+    const since = sinceRaw === '' ? undefined : Number(sinceRaw);
+    const result = await helper.fetchRestConfig(Number.isInteger(since) ? since : undefined);
+    helper.disconnect();
+    setRestResult(result);
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'warn',
+      msg: 'REST flags/config',
+      data: result,
+    });
+  }, [apiUrl, streamUrl, apiKey, restSinceVersion, addLog]);
+
+  const handleProveTamper = useCallback(() => {
+    const result = connRef.current?.proveBadSignature?.();
+    if (!result) {
+      addLog({ ts: new Date().toISOString(), level: 'warn', msg: 'Connect in config-sync mode first' });
+      return;
+    }
+    addLog({
+      ts: new Date().toISOString(),
+      level: result.ok ? 'info' : 'error',
+      msg: result.ok ? 'Tamper demo: bad signature rejected' : `Tamper demo: ${result.error}`,
+      data: result,
+    });
+  }, [addLog]);
+
+  // Prefill track flag once when flags first arrive — do not refill if the user clears the field.
+  useEffect(() => {
+    if (didPrefillTrackFlag.current) return;
+    const keys = Object.keys(flags);
+    if (keys.length === 0) return;
+    didPrefillTrackFlag.current = true;
+    setTrackFlagKey((prev) => (prev.trim() ? prev : keys[0]));
+  }, [flags]);
 
   // Cleanup on unmount
   useEffect(() => () => connRef.current?.disconnect(), []);
@@ -143,120 +630,437 @@ export default function App() {
   // ─── Render ─────────────────────────────────────────────────
 
   return (
-    <div style={{ fontFamily: FONT, background: '#0B0E14', color: '#C5CDD9', height: '100vh', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ fontFamily: FONT, background: t.bg, color: t.text, height: '100vh', display: 'flex', flexDirection: 'column' }}>
 
       {/* ── Header ── */}
-      <header style={{ background: '#111620', borderBottom: '1px solid #1E2533', padding: '12px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+      <header style={{ background: t.panel, borderBottom: `1px solid ${t.border}`, padding: '12px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 28, height: 28, borderRadius: 6, background: 'linear-gradient(135deg, #7C3AED, #4C1D95)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ width: 28, height: 28, borderRadius: 6, background: `linear-gradient(135deg, ${t.accent}, #4C1D95)`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <span style={{ color: '#fff', fontSize: 14, fontWeight: 700 }}>F</span>
           </div>
-          <span style={{ fontWeight: 700, fontSize: 15, color: '#E5E7EB', letterSpacing: '0.02em' }}>SDK Tester</span>
-          <span style={{ fontSize: 11, color: '#6B7280', border: '1px solid #2A3040', borderRadius: 4, padding: '2px 8px' }}>v1.0</span>
+          <span style={{ fontWeight: 700, fontSize: 15, color: t.textStrong, letterSpacing: '0.02em' }}>SDK Tester</span>
+          <span style={{ fontSize: 11, color: t.muted, border: `1px solid ${t.borderStrong}`, borderRadius: 4, padding: '2px 8px' }}>v1.3</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Tooltip
+            content={themeMode === 'light' ? 'Switch the UI to dark theme' : 'Switch the UI to light theme'}
+            position="bottom"
+          >
+            <button
+              type="button"
+              onClick={() => setThemeMode((m) => (m === 'light' ? 'dark' : 'light'))}
+              style={S.btnGhost}
+            >
+              {themeMode === 'light' ? 'Dark' : 'Light'}
+            </button>
+          </Tooltip>
+          <Tooltip content="Open a short guide for environments, stream URL, config-sync, and QA." position="bottom">
+            <button
+              type="button"
+              onClick={() => setShowHowTo(true)}
+              style={{
+                ...S.btnGhost,
+                color: t.accentSoft,
+                borderColor: `${t.accent}66`,
+                background: `${t.accent}18`,
+              }}
+            >
+              How to use
+            </button>
+          </Tooltip>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: STATE_COLORS[connState], boxShadow: isConnected ? '0 0 8px #10B98166' : 'none', transition: 'all 0.3s' }} />
           <span style={{ fontSize: 12, color: STATE_COLORS[connState], textTransform: 'uppercase', letterSpacing: '0.08em' }}>{connState}</span>
-          <span style={{ fontSize: 11, color: '#4B5563', marginLeft: 4 }}>
-            {TRANSPORTS.find((t) => t.id === transport)?.label || transport}
+          <span style={{ fontSize: 11, color: t.muted2, marginLeft: 4 }}>
+            {ENVIRONMENTS.find((e) => e.id === envId)?.label || envId}
+            {' · '}
+            {TRANSPORTS.find((tr) => tr.id === transport)?.label || transport}
           </span>
           {isConnected && flagCount > 0 && (
-            <span style={{ fontSize: 11, color: '#4B5563', marginLeft: 8 }}>{flagCount} flag{flagCount !== 1 ? 's' : ''}</span>
+            <span style={{ fontSize: 11, color: t.muted2, marginLeft: 8 }}>{flagCount} flag{flagCount !== 1 ? 's' : ''}</span>
           )}
         </div>
       </header>
 
+      <HowToUsePanel open={showHowTo} onClose={() => setShowHowTo(false)} theme={t} />
+
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
 
         {/* ── Left Panel — Config ── */}
-        <aside style={{ width: 380, background: '#111620', borderRight: '1px solid #1E2533', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+        <aside style={{ width: 380, background: t.panel, borderRight: `1px solid ${t.border}`, display: 'flex', flexDirection: 'column', flexShrink: 0, overflow: 'hidden' }}>
 
-          {/* Connection */}
-          <div style={{ padding: 16, borderBottom: '1px solid #1E2533' }}>
-            <label style={S.label}>API URL</label>
-            <input style={S.input} value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="http://localhost:3000" disabled={isConnected || isConnecting} />
-
-            <label style={{ ...S.label, marginTop: 12 }}>SDK Key</label>
-            <input style={S.input} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="ff_your_api_key" type="password" disabled={isConnected || isConnecting} />
-
-            <label style={{ ...S.label, marginTop: 12 }}>Transport</label>
-            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-              {TRANSPORTS.map(({ id, label }) => (
-                <button
-                  key={id}
-                  onClick={() => !isConnected && !isConnecting && setTransport(id)}
-                  disabled={isConnected || isConnecting}
-                  style={{
-                    flex: 1, padding: '6px 0', fontSize: 12, borderRadius: 4,
-                    border: `1px solid ${transport === id ? PURPLE : '#2A3040'}`,
-                    background: transport === id ? `${PURPLE}22` : 'transparent',
-                    color: transport === id ? '#A78BFA' : '#6B7280',
-                    cursor: isConnected || isConnecting ? 'not-allowed' : 'pointer',
-                    opacity: isConnected || isConnecting ? 0.5 : 1,
-                    fontFamily: FONT,
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            <div style={{ marginTop: 14, display: 'flex', gap: 8 }}>
+          {/* Connect stays visible so collapsed sections do not bury the main action */}
+          <div style={{ padding: 16, borderBottom: `1px solid ${t.border}`, flexShrink: 0 }}>
+            <div style={{ display: 'flex', gap: 8 }}>
               {isConnected || isConnecting ? (
-                <button onClick={handleDisconnect} style={{ ...S.btnDanger, flex: 1 }}>
-                  {isConnecting ? 'Cancel' : 'Disconnect'}
-                </button>
+                <Tooltip multiline content={isConnecting ? 'Cancel the in-flight connect attempt.' : 'Close the stream / socket and stop reconnecting.'} fill style={{ flex: 1 }}>
+                  <button onClick={handleDisconnect} style={{ ...S.btnDanger, width: '100%' }}>
+                    {isConnecting ? 'Cancel' : 'Disconnect'}
+                  </button>
+                </Tooltip>
               ) : (
-                <button onClick={handleConnect} disabled={!apiKey} style={{ ...S.btnPrimary, flex: 1, opacity: apiKey ? 1 : 0.4 }}>
-                  Connect
-                </button>
+                <Tooltip multiline content="Handshake on API URL, then open SSE on Stream URL (or WS/poll on API)." fill style={{ flex: 1 }}>
+                  <button onClick={handleConnect} disabled={!apiKey || !apiUrl || !streamUrl} style={{ ...S.btnPrimary, width: '100%', opacity: apiKey && apiUrl && streamUrl ? 1 : 0.4 }}>
+                    Connect
+                  </button>
+                </Tooltip>
               )}
             </div>
+            {!openSections.connection && (
+              <div style={{ marginTop: 8, fontSize: 11, color: t.muted, lineHeight: 1.4 }}>
+                {(ENVIRONMENTS.find((e) => e.id === envId)?.label || envId)}
+                {' · '}
+                {TRANSPORTS.find((tr) => tr.id === transport)?.label || transport}
+                {apiKey ? ' · key set' : ' · add SDK key in Connection'}
+              </div>
+            )}
           </div>
 
-          {/* Context */}
-          <div style={{ padding: 16, flex: 1, overflow: 'auto' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-              <span style={S.label}>Evaluation Context</span>
-              <div style={{ display: 'flex', gap: 4 }}>
-                {[['User', 'simple_user'], ['Multi', 'multi_context'], ['Empty', 'empty']].map(([label, key]) => (
-                  <button key={key} onClick={() => applyPreset(key)} style={S.preset}>{label}</button>
+          <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            <CollapsibleSection
+              title="Connection"
+              summary={`${ENVIRONMENTS.find((e) => e.id === envId)?.label || envId} · ${TRANSPORTS.find((tr) => tr.id === transport)?.label || transport}`}
+              open={openSections.connection}
+              onToggle={() => toggleSection('connection')}
+              theme={t}
+            >
+              <label style={S.label}>Environment</label>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 4 }}>
+                {ENVIRONMENTS.map(({ id, label }) => (
+                  <Tooltip key={id} content={ENV_TIPS[id]} position="top" multiline fill>
+                    <button
+                      type="button"
+                      onClick={() => !urlsLocked && applyEnvironment(id)}
+                      disabled={urlsLocked}
+                      style={{
+                        width: '100%',
+                        padding: '6px 0', fontSize: 11, borderRadius: 4,
+                        border: `1px solid ${envId === id ? t.accent : t.borderStrong}`,
+                        background: envId === id ? `${t.accent}22` : 'transparent',
+                        color: envId === id ? t.accentSoft : t.muted,
+                        cursor: urlsLocked ? 'not-allowed' : 'pointer',
+                        opacity: urlsLocked ? 0.5 : 1,
+                        fontFamily: FONT,
+                      }}
+                    >
+                      {label}
+                    </button>
+                  </Tooltip>
                 ))}
               </div>
-            </div>
 
-            {contextFields.map((field) => (
-              <div key={field.id} style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-                <input
-                  style={{ ...S.input, flex: 2, fontSize: 11, padding: '5px 8px' }}
-                  value={field.key} onChange={(e) => updateField(field.id, 'key', e.target.value)} placeholder="key"
-                />
-                <input
-                  style={{ ...S.input, flex: 3, fontSize: 11, padding: '5px 8px' }}
-                  value={field.value} onChange={(e) => updateField(field.id, 'value', e.target.value)} placeholder="value"
-                />
-                <button onClick={() => removeField(field.id)} style={{ background: 'none', border: 'none', color: '#6B7280', cursor: 'pointer', fontSize: 16, padding: '0 4px', fontFamily: FONT }}>
-                  ×
-                </button>
+              <label style={{ ...S.label, marginTop: 12 }}>API URL</label>
+              <input
+                style={{ ...S.input, opacity: isCustomEnv ? 1 : 0.75 }}
+                value={apiUrl}
+                onChange={(e) => {
+                  setEnvId('custom');
+                  setApiUrl(e.target.value);
+                }}
+                placeholder="https://staging-api.flagmint.com"
+                disabled={urlsLocked}
+                readOnly={!isCustomEnv}
+              />
+              <div style={{ fontSize: 10, color: t.muted2, marginTop: 4, lineHeight: 1.4 }}>
+                Handshake, context, QA, REST
               </div>
-            ))}
 
-            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-              <button onClick={addField} style={{ ...S.btnGhost, flex: 1 }}>+ Add Field</button>
-              {isConnected && (
-                <button onClick={handleSendContext} style={{ ...S.btnPrimary, flex: 1, fontSize: 11 }}>
-                  Send Context
-                </button>
+              <label style={{ ...S.label, marginTop: 12 }}>Stream URL</label>
+              <input
+                style={{ ...S.input, opacity: isCustomEnv ? 1 : 0.75 }}
+                value={streamUrl}
+                onChange={(e) => {
+                  setEnvId('custom');
+                  setStreamUrl(e.target.value);
+                }}
+                placeholder="https://staging-stream.flagmint.com"
+                disabled={urlsLocked}
+                readOnly={!isCustomEnv}
+              />
+              <div style={{ fontSize: 10, color: t.muted2, marginTop: 4, lineHeight: 1.4 }}>
+                SSE EventSource only (test stream host / CF bypass)
+              </div>
+
+              <label style={{ ...S.label, marginTop: 12 }}>SDK Key</label>
+              <input style={S.input} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="ff_your_api_key" type="password" disabled={isConnected || isConnecting} />
+
+              <label style={{ ...S.label, marginTop: 12 }}>Transport</label>
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                {TRANSPORTS.map(({ id, label, tip }) => (
+                  <Tooltip key={id} content={tip} position="top" multiline fill style={{ flex: 1 }}>
+                    <button
+                      type="button"
+                      onClick={() => !isConnected && !isConnecting && setTransport(id)}
+                      disabled={isConnected || isConnecting}
+                      style={{
+                        width: '100%', padding: '6px 0', fontSize: 12, borderRadius: 4,
+                        border: `1px solid ${transport === id ? t.accent : t.borderStrong}`,
+                        background: transport === id ? `${t.accent}22` : 'transparent',
+                        color: transport === id ? t.accentSoft : t.muted,
+                        cursor: isConnected || isConnecting ? 'not-allowed' : 'pointer',
+                        opacity: isConnected || isConnecting ? 0.5 : 1,
+                        fontFamily: FONT,
+                      }}
+                    >
+                      {label}
+                    </button>
+                  </Tooltip>
+                ))}
+              </div>
+            </CollapsibleSection>
+
+            <CollapsibleSection
+              title="Config sync"
+              summary={(() => {
+                if (syncMode === 'legacy') return 'Legacy flags';
+                void qaClockEpoch;
+                const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+                const leaseExpiresAt = leaseInfo?.expiresAt ?? cache?.expiresAt;
+                if (!isLocalRulesCacheComplete(cache)) return 'No saved rules';
+                if (!leaseExpiresAt || isLocalLeaseExpired({ expiresAt: leaseExpiresAt })) {
+                  return isConnected || isConnecting ? 'Rules expired — renewing' : 'Rules expired';
+                }
+                return 'Flags ready';
+              })()}
+              open={openSections.configSync}
+              onToggle={() => toggleSection('configSync')}
+              theme={t}
+            >
+              <div style={{ display: 'flex', gap: 8 }}>
+                {[
+                  { id: 'legacy', label: 'Legacy flags' },
+                  { id: 'config', label: 'fullConfig / deltas' },
+                ].map(({ id, label }) => (
+                  <Tooltip key={id} content={SYNC_TIPS[id]} position="top" multiline fill style={{ flex: 1 }}>
+                    <button
+                      type="button"
+                      onClick={() => !isConnected && !isConnecting && setSyncMode(id)}
+                      disabled={isConnected || isConnecting}
+                      style={{
+                        width: '100%', padding: '6px 0', fontSize: 11, borderRadius: 4,
+                        border: `1px solid ${syncMode === id ? t.accent : t.borderStrong}`,
+                        background: syncMode === id ? `${t.accent}22` : 'transparent',
+                        color: syncMode === id ? t.accentSoft : t.muted,
+                        cursor: isConnected || isConnecting ? 'not-allowed' : 'pointer',
+                        fontFamily: FONT,
+                      }}
+                    >
+                      {label}
+                    </button>
+                  </Tooltip>
+                ))}
+              </div>
+              {syncMode === 'config' && (
+                <div style={{ marginTop: 10, fontSize: 12, color: t.text, lineHeight: 1.5 }}>
+                  {(() => {
+                    void qaClockEpoch;
+                    const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+                    const leaseExpiresAt = leaseInfo?.expiresAt ?? cache?.expiresAt;
+                    const expired = !leaseExpiresAt || isLocalLeaseExpired({ expiresAt: leaseExpiresAt });
+                    const clientClock = getQaClientClockState();
+                    const plain = configSyncPlainStatus({
+                      cache,
+                      leaseExpiresAt,
+                      expired,
+                      transport,
+                      clientOffsetMs: clientClock.offsetMs,
+                      isConnected: isConnected || isConnecting,
+                    });
+                    return (
+                      <>
+                        <div style={{ fontWeight: 600, color: expired || transport !== 'sse' ? '#F59E0B' : t.accentSoft }}>
+                          {plain.headline}
+                        </div>
+                        {plain.detail && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: t.muted }}>{plain.detail}</div>
+                        )}
+                        {plain.warn && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: '#F59E0B' }}>{plain.warn}</div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setShowConfigSyncDetails((v) => !v)}
+                          style={{
+                            marginTop: 8,
+                            padding: 0,
+                            border: 'none',
+                            background: 'transparent',
+                            color: t.accentSoft,
+                            fontSize: 11,
+                            fontFamily: FONT,
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                          }}
+                        >
+                          {showConfigSyncDetails ? 'Hide technical details' : 'Show technical details'}
+                        </button>
+                        {showConfigSyncDetails && (
+                          <div
+                            style={{
+                              marginTop: 8,
+                              padding: 8,
+                              borderRadius: 6,
+                              border: `1px solid ${t.border}`,
+                              background: t.panelAlt || 'transparent',
+                              fontSize: 11,
+                              color: t.muted,
+                              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                              lineHeight: 1.45,
+                            }}
+                          >
+                            <div>
+                              localCache: {cache ? `v${cache.version}` : 'empty'}
+                              {expired ? ' (expired/missing → fullConfig)' : ' → sinceVersion'}
+                            </div>
+                            <div style={{ marginTop: 4 }}>
+                              {expired
+                                ? 'lease expired → fail-closed defaults + reconnect'
+                                : 'SSE + ECDH MAC verify → local eval'}
+                            </div>
+                            {leaseExpiresAt != null && (
+                              <div style={{ color: t.accentSoft, marginTop: 4 }}>
+                                lease exp {new Date(leaseExpiresAt).toISOString()}
+                              </div>
+                            )}
+                            {clientClock.offsetMs !== 0 && (
+                              <div style={{ marginTop: 4, color: '#F59E0B' }}>
+                                QA client now {clientClock.effectiveNowIso} (offset {clientClock.offsetMs}ms)
+                              </div>
+                            )}
+                            {configMeta && (
+                              <div style={{ marginTop: 4 }}>
+                                last: {configMeta.type}
+                                {configMeta.version != null ? ` @ v${configMeta.version}` : ''}
+                                {configMeta.warnings?.length ? ` ⚠ ${configMeta.warnings.length}` : ''}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
               )}
-            </div>
+            </CollapsibleSection>
 
-            {/* Preview */}
-            <div style={{ marginTop: 16 }}>
-              <span style={{ ...S.label, fontSize: 10, color: '#4B5563' }}>CONTEXT PREVIEW</span>
-              <pre style={{ background: '#0B0E14', border: '1px solid #1E2533', borderRadius: 4, padding: 10, fontSize: 10, color: '#8B949E', marginTop: 4, overflowX: 'auto', maxHeight: 160, whiteSpace: 'pre-wrap' }}>
-                {JSON.stringify(context, null, 2)}
-              </pre>
-            </div>
+            <CollapsibleSection
+              title="QA (clock / data)"
+              summary="Clock · Replay · Clear"
+              open={openSections.qa}
+              onToggle={() => toggleSection('qa')}
+              theme={t}
+            >
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {QA_ACTIONS.map((action) => {
+                  const disabled = !apiKey || qaBusy;
+                  return (
+                    <Tooltip key={action.id} content={action.tip} position="top" multiline maxWidth={240} fill>
+                      <button
+                        type="button"
+                        disabled={disabled}
+                        style={{
+                          ...S.btnQa,
+                          opacity: disabled ? 0.45 : 1,
+                          cursor: disabled ? 'not-allowed' : 'pointer',
+                        }}
+                        onClick={() => {
+                          const [label, fn] = action.run(apiUrl, apiKey);
+                          runQa(label, fn, { syncsClientClock: !!action.syncsClientClock });
+                        }}
+                      >
+                        {action.label}
+                      </button>
+                    </Tooltip>
+                  );
+                })}
+                <Tooltip
+                  content="Remove this browser’s cached rules/lease so the next connect requests fullConfig (cold start)."
+                  position="top"
+                  multiline
+                  maxWidth={240}
+                  fill
+                  style={{ gridColumn: '1 / -1' }}
+                >
+                  <button
+                    type="button"
+                    disabled={!apiKey}
+                    style={{
+                      ...S.btnQa,
+                      opacity: !apiKey ? 0.45 : 1,
+                      cursor: !apiKey ? 'not-allowed' : 'pointer',
+                    }}
+                    onClick={() => {
+                      clearLocalConfigCache(apiKey);
+                      setLeaseInfo(null);
+                      setConfigMeta(null);
+                      addLog({ ts: new Date().toISOString(), level: 'info', msg: 'Cleared localConfig cache' });
+                    }}
+                  >
+                    Clear localCache
+                  </button>
+                </Tooltip>
+              </div>
+            </CollapsibleSection>
+
+            <CollapsibleSection
+              title="Evaluation context"
+              summary={
+                contextFields.filter((f) => f.key).length
+                  ? `${contextFields.filter((f) => f.key).length} field${contextFields.filter((f) => f.key).length === 1 ? '' : 's'}`
+                  : 'Empty'
+              }
+              open={openSections.context}
+              onToggle={() => toggleSection('context')}
+              theme={t}
+              flex
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 10 }}>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {[['User', 'simple_user'], ['Multi', 'multi_context'], ['Empty', 'empty']].map(([label, key]) => (
+                    <Tooltip key={key} content={PRESET_TIPS[key]} position="bottom">
+                      <button type="button" onClick={() => applyPreset(key)} style={S.preset}>{label}</button>
+                    </Tooltip>
+                  ))}
+                </div>
+              </div>
+
+              {contextFields.map((field) => (
+                <div key={field.id} style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                  <input
+                    style={{ ...S.input, flex: 2, fontSize: 11, padding: '5px 8px' }}
+                    value={field.key} onChange={(e) => updateField(field.id, 'key', e.target.value)} placeholder="key"
+                  />
+                  <input
+                    style={{ ...S.input, flex: 3, fontSize: 11, padding: '5px 8px' }}
+                    value={field.value} onChange={(e) => updateField(field.id, 'value', e.target.value)} placeholder="value"
+                  />
+                  <Tooltip content="Remove this context field" position="left">
+                    <button type="button" onClick={() => removeField(field.id)} style={{ background: 'none', border: 'none', color: t.muted, cursor: 'pointer', fontSize: 16, padding: '0 4px', fontFamily: FONT }}>
+                      ×
+                    </button>
+                  </Tooltip>
+                </div>
+              ))}
+
+              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                <Tooltip content="Add another key/value pair to the evaluation context." fill style={{ flex: 1 }}>
+                  <button type="button" onClick={addField} style={{ ...S.btnGhost, width: '100%' }}>+ Add Field</button>
+                </Tooltip>
+                {isConnected && (
+                  <Tooltip content="Push the current context to the connection (triggers re-eval / stream update)." fill style={{ flex: 1 }}>
+                    <button type="button" onClick={handleSendContext} style={{ ...S.btnPrimary, width: '100%', fontSize: 11 }}>
+                      Send Context
+                    </button>
+                  </Tooltip>
+                )}
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <span style={{ ...S.label, fontSize: 10, color: t.muted2 }}>CONTEXT PREVIEW</span>
+                <pre style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 4, padding: 10, fontSize: 10, color: t.code, marginTop: 4, overflowX: 'auto', maxHeight: 160, whiteSpace: 'pre-wrap' }}>
+                  {JSON.stringify(context, null, 2)}
+                </pre>
+              </div>
+            </CollapsibleSection>
           </div>
         </aside>
 
@@ -264,19 +1068,25 @@ export default function App() {
         <main style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
           {/* Tabs */}
-          <div style={{ display: 'flex', borderBottom: '1px solid #1E2533', background: '#111620', padding: '0 16px', flexShrink: 0 }}>
-            {[['flags', `Flags (${flagCount})`], ['log', `Log (${logs.length})`]].map(([key, label]) => (
-              <button
-                key={key}
-                onClick={() => setActiveTab(key)}
-                style={{
-                  padding: '10px 16px', fontSize: 12, background: 'none', border: 'none',
-                  borderBottom: activeTab === key ? `2px solid ${PURPLE}` : '2px solid transparent',
-                  color: activeTab === key ? '#E5E7EB' : '#6B7280', cursor: 'pointer', marginBottom: -1, fontFamily: FONT,
-                }}
-              >
-                {label}
-              </button>
+          <div style={{ display: 'flex', borderBottom: `1px solid ${t.border}`, background: t.panel, padding: '0 16px', flexShrink: 0 }}>
+            {[
+              ['flags', `Flags (${flagCount})`, 'Live flag values from the stream (or last poll).'],
+              ['log', `Log (${logs.length})`, 'Connection, handshake, QA, and eval event log.'],
+              ['tools', 'Tools', 'Patch inspection, track events, same-version check, tamper demo, coverage.'],
+            ].map(([key, label, tip]) => (
+              <Tooltip key={key} content={tip} position="bottom" multiline>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab(key)}
+                  style={{
+                    padding: '10px 16px', fontSize: 12, background: 'none', border: 'none',
+                    borderBottom: activeTab === key ? `2px solid ${t.accent}` : '2px solid transparent',
+                    color: activeTab === key ? t.textStrong : t.muted, cursor: 'pointer', marginBottom: -1, fontFamily: FONT,
+                  }}
+                >
+                  {label}
+                </button>
+              </Tooltip>
             ))}
           </div>
 
@@ -284,7 +1094,7 @@ export default function App() {
           {activeTab === 'flags' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
               {flagCount === 0 ? (
-                <div style={{ textAlign: 'center', padding: '60px 20px', color: '#4B5563' }}>
+                <div style={{ textAlign: 'center', padding: '60px 20px', color: t.muted2 }}>
                   <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.4 }}>⚑</div>
                   <div style={{ fontSize: 14, marginBottom: 6 }}>No flags received yet</div>
                   <div style={{ fontSize: 12 }}>
@@ -303,7 +1113,7 @@ export default function App() {
                   />
 
                   {flagEntries.length === 0 && filterText && (
-                    <div style={{ color: '#4B5563', fontSize: 12, padding: 20 }}>No flags matching "{filterText}"</div>
+                    <div style={{ color: t.muted2, fontSize: 12, padding: 20 }}>No flags matching "{filterText}"</div>
                   )}
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -314,34 +1124,67 @@ export default function App() {
                       const history = flagHistory[key] || [];
 
                       return (
-                        <div key={key} style={{ background: '#111620', border: '1px solid #1E2533', borderRadius: 6, overflow: 'hidden' }}>
+                        <div key={key} style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: 6, overflow: 'hidden' }}>
                           {/* Flag Row */}
                           <div onClick={() => toggleExpand(key)} style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', cursor: 'pointer', gap: 10 }}>
-                            <span style={{ color: '#4B5563', fontSize: 10, transform: isExp ? 'rotate(90deg)' : 'rotate(0)', transition: 'transform 0.15s' }}>▶</span>
-                            <span style={{ fontWeight: 600, fontSize: 13, color: '#E5E7EB', flex: 1 }}>{key}</span>
+                            <span style={{ color: t.muted2, fontSize: 10, transform: isExp ? 'rotate(90deg)' : 'rotate(0)', transition: 'transform 0.15s' }}>▶</span>
+                            <span style={{ fontWeight: 600, fontSize: 13, color: t.textStrong, flex: 1 }}>{key}</span>
                             <span style={{ fontSize: 10, padding: '2px 8px', borderRadius: 3, background: `${colors.bg}22`, color: colors.text, border: `1px solid ${colors.dot}33` }}>
                               {type}
                             </span>
-                            <span style={{ fontSize: 12, fontWeight: 600, color: typeof val === 'boolean' ? (val ? '#10B981' : '#EF4444') : '#C5CDD9', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            <span style={{ fontSize: 12, fontWeight: 600, color: typeof val === 'boolean' ? (val ? '#10B981' : '#EF4444') : t.text, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                               {flagValueShort(val)}
                             </span>
                           </div>
 
                           {/* Expanded Detail */}
                           {isExp && (
-                            <div style={{ borderTop: '1px solid #1E2533', padding: '12px 14px', background: '#0D1017' }}>
-                              <span style={{ fontSize: 10, color: '#4B5563', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Current Value</span>
-                              <pre style={{ fontSize: 11, color: '#8B949E', margin: '4px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                            <div style={{ borderTop: `1px solid ${t.border}`, padding: '12px 14px', background: t.panelAlt }}>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}>
+                                <span style={{ fontSize: 10, color: t.muted2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Current Value</span>
+                                <Tooltip
+                                  content={
+                                    syncMode === 'config'
+                                      ? isConnected
+                                        ? 'Local getFlag(key) with sidebar context (call-site eval).'
+                                        : 'Offline local getFlag — uses rules still in memory. Lease expired → fail-closed defaults. (Use fullConfig / deltas mode.)'
+                                      : isConnected
+                                        ? 'Legacy: logs a call-site request; value comes from last server snapshot.'
+                                        : 'Offline: returns the last streamed snapshot (not live local rules). Switch Config sync → fullConfig / deltas for real offline local eval.'
+                                  }
+                                  position="left"
+                                  multiline
+                                >
+                                  <button
+                                    type="button"
+                                    disabled={!canEvaluate}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleRequestFlag(key);
+                                    }}
+                                    style={{
+                                      ...S.preset,
+                                      fontSize: 11,
+                                      padding: '4px 10px',
+                                      opacity: canEvaluate ? 1 : 0.45,
+                                      cursor: canEvaluate ? 'pointer' : 'not-allowed',
+                                    }}
+                                  >
+                                    Evaluate
+                                  </button>
+                                </Tooltip>
+                              </div>
+                              <pre style={{ fontSize: 11, color: t.code, margin: '4px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                                 {flagValueDisplay(val)}
                               </pre>
 
                               {history.length > 1 && (
-                                <div style={{ marginTop: 12, borderTop: '1px solid #1E2533', paddingTop: 10 }}>
-                                  <span style={{ fontSize: 10, color: '#4B5563', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Change History</span>
+                                <div style={{ marginTop: 12, borderTop: `1px solid ${t.border}`, paddingTop: 10 }}>
+                                  <span style={{ fontSize: 10, color: t.muted2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Change History</span>
                                   {history.map((h, i) => (
-                                    <div key={i} style={{ display: 'flex', gap: 10, fontSize: 11, marginTop: 4, color: '#6B7280' }}>
-                                      <span style={{ color: '#4B5563', flexShrink: 0 }}>{new Date(h.ts).toLocaleTimeString()}</span>
-                                      <span style={{ color: i === history.length - 1 ? '#10B981' : '#6B7280', fontWeight: i === history.length - 1 ? 600 : 400 }}>
+                                    <div key={i} style={{ display: 'flex', gap: 10, fontSize: 11, marginTop: 4, color: t.muted }}>
+                                      <span style={{ color: t.muted2, flexShrink: 0 }}>{new Date(h.ts).toLocaleTimeString()}</span>
+                                      <span style={{ color: i === history.length - 1 ? '#10B981' : t.muted, fontWeight: i === history.length - 1 ? 600 : 400 }}>
                                         {JSON.stringify(h.value)}
                                       </span>
                                     </div>
@@ -363,11 +1206,13 @@ export default function App() {
           {activeTab === 'log' && (
             <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 10, alignItems: 'center' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#6B7280', cursor: 'pointer' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: t.muted, cursor: 'pointer' }}>
                   <input type="checkbox" checked={showDebug} onChange={(e) => setShowDebug(e.target.checked)} />
                   Show debug
                 </label>
-                <button onClick={() => setLogs([])} style={S.preset}>Clear</button>
+                <Tooltip content="Clear all log entries from this session." position="left">
+                  <button type="button" onClick={() => setLogs([])} style={S.preset}>Clear</button>
+                </Tooltip>
               </div>
 
               <div style={{ fontSize: 11, lineHeight: 1.8 }}>
@@ -375,7 +1220,7 @@ export default function App() {
                   .filter((l) => showDebug || l.level !== 'debug')
                   .map((entry, i) => (
                     <div key={i} style={{ display: 'flex', gap: 8, color: logColor(entry.level) }}>
-                      <span style={{ color: '#4B5563', flexShrink: 0, width: 72 }}>
+                      <span style={{ color: t.muted2, flexShrink: 0, width: 72 }}>
                         {new Date(entry.ts).toLocaleTimeString()}
                       </span>
                       <span style={{ flexShrink: 0, width: 40, textTransform: 'uppercase', fontSize: 10, lineHeight: '20px' }}>
@@ -385,8 +1230,8 @@ export default function App() {
                         {entry.msg}
                         {entry.data && (
                           <details style={{ display: 'inline', marginLeft: 6 }}>
-                            <summary style={{ color: '#4B5563', cursor: 'pointer', display: 'inline', fontSize: 10 }}>[data]</summary>
-                            <pre style={{ fontSize: 10, color: '#4B5563', marginTop: 2, whiteSpace: 'pre-wrap' }}>
+                            <summary style={{ color: t.muted2, cursor: 'pointer', display: 'inline', fontSize: 10 }}>[data]</summary>
+                            <pre style={{ fontSize: 10, color: t.muted2, marginTop: 2, whiteSpace: 'pre-wrap' }}>
                               {JSON.stringify(entry.data, null, 2)}
                             </pre>
                           </details>
@@ -398,11 +1243,35 @@ export default function App() {
               </div>
 
               {logs.length === 0 && (
-                <div style={{ textAlign: 'center', padding: '40px 20px', color: '#4B5563', fontSize: 12 }}>
+                <div style={{ textAlign: 'center', padding: '40px 20px', color: t.muted2, fontSize: 12 }}>
                   No log entries yet. Connect to start seeing protocol traffic.
                 </div>
               )}
             </div>
+          )}
+
+          {activeTab === 'tools' && (
+            <ToolsPanel
+              theme={t}
+              styles={S}
+              lastPatch={lastPatch}
+              syncMode={syncMode}
+              isConnected={isConnected}
+              apiKey={apiKey}
+              flagKeys={Object.keys(flags)}
+              trackFlagKey={trackFlagKey}
+              setTrackFlagKey={setTrackFlagKey}
+              trackEventName={trackEventName}
+              setTrackEventName={setTrackEventName}
+              trackKind={trackKind}
+              setTrackKind={setTrackKind}
+              onSendTrack={handleSendTrack}
+              restSinceVersion={restSinceVersion}
+              setRestSinceVersion={setRestSinceVersion}
+              onFetchRestConfig={handleFetchRestConfig}
+              onProveTamper={handleProveTamper}
+              restResult={restResult}
+            />
           )}
         </main>
       </div>

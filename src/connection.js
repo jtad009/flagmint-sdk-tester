@@ -1,15 +1,23 @@
 /**
  * Lightweight Flagmint connection client.
  *
- * Speaks the Flagmint wire protocol directly — does NOT use any SDK.
- * This is intentional: we test the server contract, not the SDK's
- * interpretation of it.
+ * Speaks the Flagmint wire protocol directly — does NOT use FlagClient.
+ * This is intentional: we test the server contract.
+ *
+ * Config-sync mode reuses the JS SDK's pure modules (ECDH, MAC, RulesStore,
+ * local eval) via Vite alias `@flagmint/config-sync` so crypto/eval stay in
+ * lockstep with the SDK without importing the full client.
  *
  * Transports:
  *   sse          — ASL handshake → GET /evaluator/v2/flags/stream → POST /context
- *   websocket    — GET /ws/sdk?apiKey=…
+ *   websocket    — GET /ws/sdk?apiKey=… (legacy evaluated; config-sync is SSE-only)
  *   long-polling — POST /evaluator/evaluate
  */
+
+import { performAslHandshake } from '@flagmint/config-sync';
+import { createConfigSyncRuntime } from './configSyncRuntime';
+import { qaClientNowMs } from './qa';
+import { describeConfigPatch } from './configPatchSummary';
 
 export const CONNECTION_STATES = {
   DISCONNECTED: 'disconnected',
@@ -18,7 +26,7 @@ export const CONNECTION_STATES = {
   ERROR: 'error',
 };
 
-const TESTER_WRAPPER = { name: 'sdk-tester', version: '1.0.0' };
+const TESTER_WRAPPER = { name: 'sdk-tester', version: '1.3.0' };
 const MAX_RECONNECT_DELAY_MS = 15000;
 
 function trimSlash(url) {
@@ -56,8 +64,71 @@ function isQuotaPayload(payload) {
   );
 }
 
-export function createFlagmintConnection({ url, apiKey, transport, onFlags, onState, onLog }) {
-  const baseUrl = trimSlash(url);
+/** Wire-patch size so logs don’t look like a fullConfig when local eval lists all flags. */
+function summarizeConfigPatch(eventName, payload) {
+  if (eventName === 'delta') {
+    return {
+      upserts: Array.isArray(payload.upserts) ? payload.upserts.length : 0,
+      deletes: Array.isArray(payload.deletes) ? payload.deletes.length : 0,
+      fromVersion: payload.fromVersion,
+      toVersion: payload.toVersion,
+    };
+  }
+  if (eventName === 'deltas') {
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    let upserts = 0;
+    let deletes = 0;
+    for (const step of items) {
+      upserts += Array.isArray(step?.upserts) ? step.upserts.length : 0;
+      deletes += Array.isArray(step?.deletes) ? step.deletes.length : 0;
+    }
+    return {
+      steps: items.length,
+      upserts,
+      deletes,
+      fromVersion: payload.fromVersion,
+      toVersion: payload.toVersion,
+    };
+  }
+  if (eventName === 'fullConfig') {
+    return {
+      flagsInPayload: Array.isArray(payload.flags) ? payload.flags.length : 0,
+    };
+  }
+  return {};
+}
+
+export function createFlagmintConnection({
+  url,
+  /** SSE host; defaults to `url`. Use stream.flagmint.com / staging-stream when testing CF bypass. */
+  streamUrl,
+  apiKey,
+  transport,
+  onFlags,
+  onState,
+  onLog,
+  /** 'legacy' = evaluated flags; 'config' = fullConfig/deltas + lease */
+  syncMode = 'legacy',
+  /** Optional hooks for config-sync events */
+  onLease,
+  onConfig,
+  /** Structured upsert/delete/segment summary after each config event */
+  onConfigPatch,
+  /** After a verified apply — persist RulesStore snapshot for localCache */
+  onRulesSnapshot,
+  /** () => number | undefined — localCache version for sinceVersion */
+  getSinceVersion,
+  /** () => boolean — force fullConfig=true even if cache exists */
+  forceFullConfig,
+  /** Optional cache blob to hydrate RulesStore before connect (warm start) */
+  initialRulesSnapshot,
+}) {
+  const apiBaseUrl = trimSlash(url);
+  const streamBaseUrl = trimSlash(streamUrl || url);
+  const configRuntime = syncMode === 'config' ? createConfigSyncRuntime() : null;
+  if (configRuntime && initialRulesSnapshot) {
+    configRuntime.hydrateFromCache(initialRulesSnapshot);
+  }
 
   let ws = null;
   let eventSource = null;
@@ -69,16 +140,199 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
   let connectionId = null;
   let reconnectAttempts = 0;
   let sawConnected = false;
+  /** Avoid stacking reconnects when many Evaluate clicks hit an expired lease. */
+  let leaseRenewInFlight = false;
+  /** Last evaluated flag map (legacy stream / local eval). */
+  let lastFlags = {};
+  /** Analytics map from SSE `flags` packets; null until received. */
+  let analyticsByFlag = null;
+
+  /** Last signed config payload (for tamper demo). */
+  let lastSignedConfig = null;
 
   const log = (level, msg, data) => {
     onLog?.({ ts: new Date().toISOString(), level, msg, data });
   };
 
+  /**
+   * Notify UI with a plain summary of upserts / deletes / segments.
+   *
+   * @param {string} eventName
+   * @param {Record<string, unknown>} payload
+   * @param {{ ok?: boolean, reason?: string }} [meta]
+   * @returns {void}
+   */
+  const emitConfigPatch = (eventName, payload, meta = {}) => {
+    const summary = describeConfigPatch(eventName, payload, meta);
+    onConfigPatch?.(summary);
+  };
+
+  /**
+   * Push a flag map to the UI and remember it for legacy call-site Evaluate.
+   *
+   * @param {Record<string, unknown>} flags Evaluated key → value map
+   * @param {string} [source] Log label (e.g. `SSE flags event`)
+   * @returns {void}
+   */
   const applyFlags = (flags, source) => {
     const map = flags && typeof flags === 'object' && !Array.isArray(flags) ? flags : {};
+    lastFlags = { ...map };
     const count = Object.keys(map).length;
     log('info', `Received ${count} flag${count !== 1 ? 's' : ''}${source ? ` (${source})` : ''}`, { flags: map });
     onFlags(map);
+  };
+
+  /**
+   * Resolve the visitor id used in evaluation reports from evaluation context.
+   * Prefers `user.key`, then `userKey`, then top-level `key`.
+   *
+   * @param {Record<string, unknown>|null|undefined} ctx
+   * @returns {string|undefined}
+   */
+  const userKeyFromContext = (ctx) => {
+    if (!ctx || typeof ctx !== 'object') return undefined;
+    const user = ctx.user;
+    if (user && typeof user === 'object' && !Array.isArray(user) && typeof user.key === 'string' && user.key) {
+      return user.key;
+    }
+    if (typeof ctx.userKey === 'string' && ctx.userKey) return ctx.userKey;
+    if (typeof ctx.key === 'string' && ctx.key) return ctx.key;
+    return undefined;
+  };
+
+  /**
+   * Whether call-site analytics should be reported for this flag key.
+   * Config-sync reads `analytics_enabled` from RulesStore; legacy uses the SSE analytics map
+   * (or allows and lets the server drop when the map has not arrived yet).
+   *
+   * @param {string} key Flag key
+   * @returns {boolean}
+   */
+  const isAnalyticsOn = (key) => {
+    if (configRuntime) {
+      const flag = configRuntime.getState().flags.get(key);
+      return flag?.analytics_enabled === true;
+    }
+    if (analyticsByFlag === null) return true;
+    return analyticsByFlag[key] === true;
+  };
+
+  /**
+   * POST a call-site evaluation event for the Evaluations dashboard card.
+   * Fire-and-forget; never throws to the caller. Skips when analytics is off for the flag.
+   * Caller must ensure lease freshness before evaluating / choosing variationValue.
+   *
+   * @param {string} flagKey
+   * @param {unknown} variationValue Served value for variation breakdown
+   * @param {Record<string, unknown>} ctx Current evaluation context
+   * @returns {void}
+   */
+  const reportCallSiteEvaluation = (flagKey, variationValue, ctx) => {
+    if (!isAnalyticsOn(flagKey)) {
+      log('debug', `getFlag(${flagKey}) skipped evaluation report (analytics off)`);
+      return;
+    }
+    const body = {
+      events: [{
+        flagKey,
+        kind: 'evaluation',
+        variationValue,
+        userKey: userKeyFromContext(ctx),
+        count: 1,
+        timestamp: new Date().toISOString(),
+      }],
+    };
+    void fetch(`${apiBaseUrl}/evaluator/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+      },
+      body: JSON.stringify(body),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          log('warn', `Evaluation report failed (${res.status})`, { flagKey, body: text.slice(0, 200) });
+          return;
+        }
+        log('info', `Evaluation reported for ${flagKey}`, { flagKey, variationValue });
+      })
+      .catch((err) => {
+        log('warn', `Evaluation report network error: ${err?.message || err}`, { flagKey });
+      });
+  };
+
+  const publishLocalEval = (source) => {
+    if (!configRuntime) return;
+    const evaluated = configRuntime.evaluate(currentContext || {});
+    applyFlags(evaluated, source || 'local eval');
+  };
+
+  const applyConfigEvent = (eventName, payload) => {
+    if (!configRuntime) return;
+    if (!configRuntime.store.getMacKey()) {
+      log('error', `Config-sync ${eventName} ignored — no ECDH MAC key from handshake`);
+      return;
+    }
+    const result = configRuntime.applySignedEvent(eventName, payload, currentContext || {});
+    if (!result.ok) {
+      log('error', `Config-sync ${eventName} rejected (${result.reason})`, {
+        reason: result.reason,
+        version: configRuntime.getState().version,
+        needsFullConfig: result.state?.needsFullConfig,
+      });
+      emitConfigPatch(eventName, payload, { ok: false, reason: result.reason });
+      if (eventName === 'lease') onLease?.(payload);
+      else onConfig?.(payload);
+
+      // Missed a patch while connected — tear down and come back with fullConfig
+      // (same recovery reconnect uses after a stream drop).
+      if (result.reason === 'version_gap' && !destroyed && sawConnected) {
+        log('warn', 'Config-sync version gap — reconnecting to request fullConfig');
+        closeEventSource();
+        connectionId = null;
+        scheduleSseReconnect();
+      }
+      return;
+    }
+
+    lastSignedConfig = { eventName, payload };
+    log('info', `Config-sync ${eventName} verified + applied`, {
+      version: result.state.version,
+      expiresAt: result.state.expiresAt,
+      flagsInStore: result.state.flags.size,
+      needsFullConfig: result.state.needsFullConfig,
+      ...summarizeConfigPatch(eventName, payload),
+    });
+    emitConfigPatch(eventName, payload, { ok: true });
+
+    if (eventName === 'lease') onLease?.(payload);
+    else onConfig?.(payload);
+
+    onRulesSnapshot?.(result.snapshot);
+    // Lease alone can arrive while needsFullConfig is still set — keep the
+    // renewal marker until the store is actually ready for local eval.
+    if (configRuntime.isLeaseReady()) {
+      leaseRenewInFlight = false;
+    }
+
+    // Lease alone may not change flags; still re-eval when we have rules.
+    if (result.state.flags.size > 0 && !result.state.needsFullConfig) {
+      applyFlags(result.evaluated, `${eventName} local eval`);
+    } else if (eventName === 'fullConfig' || eventName === 'deltas' || eventName === 'delta') {
+      applyFlags(result.evaluated, `${eventName} local eval`);
+    }
+  };
+
+  /**
+   * Allow a later getFlag / context call to start another lease renew after a
+   * terminal connect failure (handshake/stream never reached a ready store).
+   *
+   * @returns {void}
+   */
+  const clearLeaseRenewInFlight = () => {
+    leaseRenewInFlight = false;
   };
 
   const clearTimers = () => {
@@ -93,54 +347,43 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
   // ─── SSE ────────────────────────────────────────────────────
 
   const handshake = async () => {
-    const handshakeUrl = `${baseUrl}/auth/asl-handshake`;
-    log('info', `ASL handshake POST ${handshakeUrl}`);
+    const handshakeUrl = `${apiBaseUrl}/auth/asl-handshake`;
+    const withEcdh = syncMode === 'config';
+    log('info', `ASL handshake POST ${handshakeUrl}`, { withEcdh });
 
-    let res;
     try {
-      res = await fetch(handshakeUrl, {
-        method: 'POST',
-        headers: { 'x-api-key': apiKey },
+      const result = await performAslHandshake({
+        handshakeUrl,
+        apiKey,
+        withEcdh,
       });
+
+      if (withEcdh) {
+        if (!result.configMacKey) {
+          throw new Error('ASL ECDH incomplete: MAC key missing after handshake.');
+        }
+        configRuntime.setMacKey(result.configMacKey);
+        log('info', 'Handshake ECDH derived session MAC key', {
+          sessionId: `${result.sessionId.slice(0, 16)}…`,
+          keyAgreement: result.keyAgreement,
+          salt: result.salt ? `${String(result.salt).slice(0, 8)}…` : undefined,
+        });
+      } else {
+        log('info', 'Handshake issued a single-use sessionId', {
+          sessionId: `${result.sessionId.slice(0, 16)}…`,
+        });
+      }
+
+      return result.sessionId;
     } catch (err) {
-      throw new Error(
-        `Handshake network error: ${err.message}. Is FF-EU running at ${baseUrl}, and is CORS allowing this origin?`
-      );
+      const code = err?.code ? ` [${err.code}]` : '';
+      if (err?.message?.includes('Failed to fetch') || err?.message?.includes('network')) {
+        throw new Error(
+          `Handshake network error: ${err.message}. Is FF-EU running at ${apiBaseUrl}, and is CORS allowing this origin?`,
+        );
+      }
+      throw new Error(`${err.message || 'Handshake failed'}${code}`);
     }
-
-    const body = await res.json().catch(() => ({}));
-    log(res.ok ? 'debug' : 'error', `Handshake HTTP ${res.status}`, body);
-
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Handshake unauthorized (${res.status}). Check the SDK key.`);
-    }
-    if (res.status === 404) {
-      throw new Error(
-        `Handshake route not found (404). Restart FF-EU so it loads POST /auth/asl-handshake (SSE). Body: ${body.message || res.statusText}`
-      );
-    }
-    if (res.status === 429) {
-      throw new Error(body.message || 'Handshake rate limited (429).');
-    }
-    if (!res.ok) {
-      throw new Error(`Handshake failed (${res.status}): ${body.message || res.statusText}`);
-    }
-
-    const sessionId =
-      (typeof body?.data?.sessionId === 'string' && body.data.sessionId) ||
-      (typeof body?.sessionId === 'string' && body.sessionId) ||
-      (typeof body?.data === 'string' ? body.data : null);
-
-    if (!sessionId) {
-      throw new Error(
-        `Handshake response did not include a sessionId. Body: ${JSON.stringify(body)}`
-      );
-    }
-
-    log('info', 'Handshake issued a single-use sessionId', {
-      sessionId: `${sessionId.slice(0, 16)}…`,
-    });
-    return sessionId;
   };
 
   const closeEventSource = () => {
@@ -158,18 +401,38 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
       wrapperName: TESTER_WRAPPER.name,
       wrapperVersion: TESTER_WRAPPER.version,
     });
-    // context is already URI-encoded base64; append raw so it is not double-encoded
-    const streamUrl =
-      `${baseUrl}/evaluator/v2/flags/stream?${params.toString()}` +
+
+    if (syncMode === 'config') {
+      const now = qaClientNowMs();
+      const since = typeof getSinceVersion === 'function' ? getSinceVersion() : undefined;
+      const hasSince = Number.isInteger(since);
+      const storeWantsFull = configRuntime?.store?.wantsFullConfig?.(now) === true;
+      const wantFull =
+        storeWantsFull ||
+        (typeof forceFullConfig === 'function' && forceFullConfig()) ||
+        !hasSince;
+      params.set('fullConfig', wantFull ? 'true' : 'false');
+      if (!wantFull) {
+        params.set('sinceVersion', String(since));
+      }
+    }
+
+    const eventSourceUrl =
+      `${streamBaseUrl}/evaluator/v2/flags/stream?${params.toString()}` +
       `&context=${encodeContextQueryParam(context)}`;
 
-    log('info', `Opening SSE ${baseUrl}/evaluator/v2/flags/stream`, {
+    log('info', `Opening SSE ${streamBaseUrl}/evaluator/v2/flags/stream`, {
       sessionId: `${sessionId.slice(0, 16)}…`,
+      apiHost: apiBaseUrl,
+      streamHost: streamBaseUrl,
+      syncMode,
+      fullConfig: params.get('fullConfig'),
+      sinceVersion: params.get('sinceVersion'),
       context,
       note: 'Do not send x-api-key on this GET — the session token is the credential.',
     });
 
-    const es = new EventSource(streamUrl);
+    const es = new EventSource(eventSourceUrl);
     eventSource = es;
     sawConnected = false;
 
@@ -188,11 +451,73 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
       onState(CONNECTION_STATES.CONNECTED);
     });
 
+    es.addEventListener('lease', (event) => {
+      const payload = parseJsonSafe(event.data);
+      if (syncMode === 'config') {
+        applyConfigEvent('lease', payload);
+        return;
+      }
+      log('info', 'SSE lease (connect renew)', payload);
+      onLease?.(payload);
+    });
+
+    es.addEventListener('fullConfig', (event) => {
+      const payload = parseJsonSafe(event.data);
+      if (syncMode === 'config') {
+        applyConfigEvent('fullConfig', payload);
+        return;
+      }
+      log('info', 'SSE fullConfig', {
+        version: payload.version,
+        flags: Array.isArray(payload.flags) ? payload.flags.length : 0,
+        warnings: payload.warnings,
+        expiresAt: payload.expiresAt,
+      });
+      onConfig?.(payload);
+    });
+
+    es.addEventListener('deltas', (event) => {
+      const payload = parseJsonSafe(event.data);
+      if (syncMode === 'config') {
+        applyConfigEvent('deltas', payload);
+        return;
+      }
+      log('info', 'SSE deltas catch-up', {
+        fromVersion: payload.fromVersion,
+        toVersion: payload.toVersion,
+        steps: Array.isArray(payload.items) ? payload.items.length : 0,
+      });
+      onConfig?.(payload);
+    });
+
+    es.addEventListener('delta', (event) => {
+      const payload = parseJsonSafe(event.data);
+      if (syncMode === 'config') {
+        applyConfigEvent('delta', payload);
+        return;
+      }
+      log('info', 'SSE delta (live)', {
+        fromVersion: payload.fromVersion,
+        toVersion: payload.toVersion,
+        upserts: Array.isArray(payload.upserts) ? payload.upserts.length : 0,
+        deletes: payload.deletes,
+      });
+      onConfig?.(payload);
+    });
+
     es.addEventListener('flags', (event) => {
+      if (syncMode === 'config') {
+        // Config mode evaluates locally; ignore legacy evaluated-flag packets.
+        log('debug', 'Ignoring flags event in config-sync mode (local eval)');
+        return;
+      }
       const payload = parseJsonSafe(event.data);
       if (!payload.flags || typeof payload.flags !== 'object' || Array.isArray(payload.flags)) {
         log('warn', 'Ignoring flags event without a flags object', { raw: event.data });
         return;
+      }
+      if (payload.analytics && typeof payload.analytics === 'object' && !Array.isArray(payload.analytics)) {
+        analyticsByFlag = payload.analytics;
       }
       applyFlags(payload.flags, 'SSE flags event');
     });
@@ -207,14 +532,13 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
       }
 
       destroyed = true;
+      clearLeaseRenewInFlight();
       closeEventSource();
       connectionId = null;
       onState(CONNECTION_STATES.ERROR);
     });
 
     es.addEventListener('error', (event) => {
-      // Named `event: error` from the server has JSON data.
-      // EventSource also fires a generic error Event on network drop — ignore those here.
       if (typeof event.data !== 'string' || !event.data) return;
 
       const payload = parseJsonSafe(event.data);
@@ -230,6 +554,7 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
         return;
       }
 
+      clearLeaseRenewInFlight();
       onState(CONNECTION_STATES.ERROR);
     });
 
@@ -239,7 +564,6 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
         return;
       }
 
-      // Close immediately so the browser does not auto-reconnect with a consumed sessionId.
       closeEventSource();
       connectionId = null;
 
@@ -249,6 +573,7 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
         return;
       }
 
+      clearLeaseRenewInFlight();
       log('error', 'SSE stream failed to open. Check handshake, CORS, and API URL (Network tab).');
       onState(CONNECTION_STATES.ERROR);
     };
@@ -267,6 +592,36 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
     }, delay);
   };
 
+  /**
+   * If config-sync lease is past expiresAt (tester QA clock): fail-closed,
+   * force fullConfig reconnect.
+   *
+   * @returns {boolean} True when the lease is still valid
+   */
+  const ensureConfigSyncLeaseFresh = () => {
+    if (syncMode !== 'config' || !configRuntime) return true;
+    const now = qaClientNowMs();
+    if (configRuntime.isLeaseReady(now)) {
+      leaseRenewInFlight = false;
+      return true;
+    }
+    configRuntime.markLeaseExpired();
+    onRulesSnapshot?.(configRuntime.getSnapshot());
+    if (!leaseRenewInFlight && transport === 'sse' && !destroyed) {
+      leaseRenewInFlight = true;
+      log('warn', 'Config-sync lease expired — fail-closed to defaults; reconnecting for fullConfig', {
+        now: new Date(now).toISOString(),
+        expiresAt: configRuntime.getState().expiresAt
+          ? new Date(configRuntime.getState().expiresAt).toISOString()
+          : null,
+      });
+      closeEventSource();
+      connectionId = null;
+      scheduleSseReconnect();
+    }
+    return false;
+  };
+
   const connectSSE = async (context) => {
     if (destroyed) return;
     closeEventSource();
@@ -274,22 +629,38 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
 
     try {
       const sessionId = await handshake();
-      if (destroyed) return;
+      if (destroyed) {
+        clearLeaseRenewInFlight();
+        return;
+      }
       openStream(sessionId, context || {});
     } catch (err) {
+      clearLeaseRenewInFlight();
       log('error', `SSE connect failed: ${err.message}`, { error: err.message });
       onState(CONNECTION_STATES.ERROR);
     }
   };
 
   const sendContextSSE = async (context) => {
-    if (!connectionId) {
+    // Config-sync: renew lease stream if expired, then re-evaluate (defaults if fail-closed).
+    if (syncMode === 'config' && configRuntime) {
+      ensureConfigSyncLeaseFresh();
+      publishLocalEval('local eval after context');
+      if (!connectionId) {
+        log('warn', 'Context evaluated locally — SSE not connected yet; skipping telemetry POST.');
+        return;
+      }
+    } else if (!connectionId) {
       log('warn', 'Cannot send context — SSE is not connected yet (no connectionId).');
       return;
     }
 
-    const contextUrl = `${baseUrl}/evaluator/v2/flags/context`;
-    log('info', `POST ${contextUrl}`, { connectionId, context });
+    const contextUrl = `${apiBaseUrl}/evaluator/v2/flags/context`;
+    log('info', `POST ${contextUrl}`, {
+      connectionId,
+      context,
+      note: syncMode === 'config' ? 'telemetry (local eval already applied)' : undefined,
+    });
 
     try {
       const res = await fetch(contextUrl, {
@@ -304,7 +675,11 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
       const body = await res.json().catch(() => ({}));
 
       if (res.status === 202) {
-        log('info', 'Context update queued (202). Flags arrive on the stream after ~400ms debounce.', body);
+        if (syncMode === 'config') {
+          log('info', 'Context telemetry accepted (202). Flags already from local eval.', body);
+        } else {
+          log('info', 'Context update queued (202). Flags arrive on the stream after ~400ms debounce.', body);
+        }
         return;
       }
 
@@ -337,7 +712,7 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
   // ─── WebSocket ──────────────────────────────────────────────
 
   const connectWS = (context) => {
-    const wsUrl = baseUrl.replace(/^http/, 'ws');
+    const wsUrl = apiBaseUrl.replace(/^http/, 'ws');
     const fullUrl = `${wsUrl}/ws/sdk?apiKey=${apiKey}`;
     log('info', `Connecting WebSocket to ${wsUrl}/ws/sdk`, { apiKey: '***' });
 
@@ -395,13 +770,13 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
   // ─── Long Polling ───────────────────────────────────────────
 
   const connectPolling = async (context) => {
-    log('info', `Starting long-polling to ${baseUrl}/evaluator/evaluate`);
+    log('info', `Starting long-polling to ${apiBaseUrl}/evaluator/evaluate`);
 
     const doFetch = async () => {
       if (destroyed) return;
 
       try {
-        const res = await fetch(`${baseUrl}/evaluator/evaluate`, {
+        const res = await fetch(`${apiBaseUrl}/evaluator/evaluate`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -440,8 +815,14 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
     if (transport === 'sse') {
       void connectSSE(context);
     } else if (transport === 'websocket') {
+      if (syncMode === 'config') {
+        log('warn', 'Config-sync local eval is SSE-only; WebSocket stays legacy-evaluated.');
+      }
       connectWS(context);
     } else {
+      if (syncMode === 'config') {
+        log('warn', 'Config-sync local eval is SSE-only; long-polling stays server evaluate.');
+      }
       void connectPolling(context);
     }
   };
@@ -461,11 +842,202 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
     }
   };
 
+  /**
+   * Call-site style request for one flag using the given (sidebar) context.
+   * Config-sync: local evaluateSdkFlag. Legacy: returns last streamed value.
+   * Both paths POST kind=evaluation when analytics is on for that flag.
+   * Expired lease → fail-closed default + reconnect (still returns a value).
+   */
+  const requestFlag = (key, context) => {
+    const ctx = context ?? currentContext ?? {};
+    currentContext = ctx;
+
+    if (syncMode === 'config' && configRuntime) {
+      const leaseOk = ensureConfigSyncLeaseFresh();
+      if (!leaseOk) {
+        const value = configRuntime.failClosedDefault(key);
+        lastFlags = { ...lastFlags, [key]: value };
+        log('warn', `getFlag(${key}) lease expired — fail-closed default`, {
+          key,
+          value,
+          context: ctx,
+        });
+        reportCallSiteEvaluation(key, value, ctx);
+        return { ok: true, value, key, leaseExpired: true };
+      }
+      const result = configRuntime.evaluateFlag(key, ctx);
+      if (!result.ok) {
+        log('warn', `getFlag(${key}) failed: ${result.reason}`, { key, reason: result.reason, context: ctx });
+        return { ok: false, reason: result.reason };
+      }
+      lastFlags = { ...lastFlags, [key]: result.value };
+      log('info', `getFlag(${key}) local eval`, { key, value: result.value, context: ctx });
+      reportCallSiteEvaluation(key, result.value, ctx);
+      return { ok: true, value: result.value, key };
+    }
+
+    const value = Object.prototype.hasOwnProperty.call(lastFlags, key)
+      ? lastFlags[key]
+      : undefined;
+    log('info', `getFlag(${key}) legacy (last server-evaluated snapshot)`, {
+      key,
+      value,
+      context: ctx,
+    });
+    reportCallSiteEvaluation(key, value, ctx);
+    return { ok: true, value, key, legacy: true };
+  };
+
+  /**
+   * POST custom / error / evaluation events to /evaluator/events.
+   *
+   * @param {{
+   *   kind: 'custom'|'error'|'evaluation',
+   *   flagKey: string,
+   *   eventName?: string,
+   *   variationValue?: unknown,
+   * }} input
+   * @returns {Promise<{ ok: boolean, status?: number, body?: unknown, error?: string }>}
+   */
+  const sendTrackEvent = async (input) => {
+    const flagKey = String(input?.flagKey || '').trim();
+    if (!flagKey) return { ok: false, error: 'flagKey required' };
+    const kind = input.kind || 'custom';
+    const event = {
+      flagKey,
+      kind,
+      userKey: userKeyFromContext(currentContext),
+      timestamp: new Date().toISOString(),
+    };
+    if (kind === 'custom') {
+      const eventName = String(input.eventName || '').trim();
+      if (!eventName) return { ok: false, error: 'eventName required for custom' };
+      event.eventName = eventName;
+    } else if (input.eventName) {
+      event.eventName = String(input.eventName);
+    }
+    if (Object.prototype.hasOwnProperty.call(input, 'variationValue')) {
+      event.variationValue = input.variationValue;
+    }
+
+    try {
+      const res = await fetch(`${apiBaseUrl}/evaluator/events`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+        },
+        body: JSON.stringify({ events: [event] }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        log('warn', `Track ${kind} failed (${res.status})`, body);
+        return { ok: false, status: res.status, body };
+      }
+      log('info', `Track ${kind} accepted`, { flagKey, eventName: event.eventName });
+      return { ok: true, status: res.status, body };
+    } catch (err) {
+      log('warn', `Track ${kind} network error: ${err?.message || err}`);
+      return { ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  /**
+   * One-shot REST catch-up: ECDH handshake + GET /evaluator/v2/flags/config.
+   * Use sinceVersion = current cache version to prove lease-only.
+   *
+   * @param {number} [sinceVersion]
+   * @returns {Promise<{ ok: boolean, payload?: Record<string, unknown>, error?: string }>}
+   */
+  const fetchRestConfig = async (sinceVersion) => {
+    if (syncMode !== 'config') {
+      return { ok: false, error: 'Switch to fullConfig / deltas mode first' };
+    }
+    try {
+      const result = await performAslHandshake({
+        handshakeUrl: `${apiBaseUrl}/auth/asl-handshake`,
+        apiKey,
+        withEcdh: true,
+      });
+      if (!result.configMacKey) {
+        return { ok: false, error: 'ECDH MAC key missing from handshake' };
+      }
+      const params = new URLSearchParams({ sessionId: result.sessionId });
+      if (Number.isInteger(sinceVersion)) {
+        params.set('sinceVersion', String(sinceVersion));
+      }
+      const res = await fetch(`${apiBaseUrl}/evaluator/v2/flags/config?${params}`, {
+        headers: { 'x-api-key': apiKey },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        log('warn', `REST flags/config failed (${res.status})`, body);
+        return { ok: false, error: body.message || body.error || `HTTP ${res.status}`, status: res.status };
+      }
+      const payload = body.data ?? body;
+      log('info', 'REST flags/config', {
+        type: payload.type,
+        version: payload.version,
+        sinceVersion,
+      });
+      // Verify with a throwaway store so we do not mutate the live stream store.
+      const probe = createConfigSyncRuntime();
+      probe.setMacKey(result.configMacKey);
+      const apply = probe.applySignedEvent(payload.type || 'lease', payload, currentContext || {});
+      probe.clearMacKey();
+      if (!apply.ok) {
+        emitConfigPatch(payload.type || 'lease', payload, { ok: false, reason: apply.reason });
+        return { ok: false, error: `signature/apply failed: ${apply.reason}`, payload };
+      }
+      emitConfigPatch(payload.type || 'lease', payload, { ok: true });
+      return { ok: true, payload, verified: true };
+    } catch (err) {
+      log('error', `REST flags/config error: ${err?.message || err}`);
+      return { ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  /**
+   * Flip one hex nibble on the last signed payload and re-apply — expect reject.
+   *
+   * @returns {{ ok: boolean, rejected?: boolean, reason?: string, error?: string }}
+   */
+  const proveBadSignature = () => {
+    if (!configRuntime) {
+      return { ok: false, error: 'Config-sync mode required' };
+    }
+    if (!lastSignedConfig?.payload) {
+      return { ok: false, error: 'No signed payload yet — connect and wait for lease/fullConfig/delta' };
+    }
+    if (!configRuntime.store.getMacKey()) {
+      return { ok: false, error: 'No session MAC key (reconnect in config mode)' };
+    }
+    const { eventName, payload } = lastSignedConfig;
+    const originalSig = typeof payload.signature === 'string' ? payload.signature : '';
+    if (originalSig.length < 2) {
+      return { ok: false, error: 'Last payload has no signature to tamper' };
+    }
+    const flipped = (originalSig[0] === '0' ? '1' : '0') + originalSig.slice(1);
+    const tampered = { ...payload, signature: flipped };
+    const result = configRuntime.applySignedEvent(eventName, tampered, currentContext || {});
+    if (result.ok) {
+      log('error', 'Tamper demo FAILED — bad signature was accepted', { eventName });
+      emitConfigPatch(eventName, tampered, { ok: true });
+      return { ok: false, error: 'Unexpected: tampered signature was accepted' };
+    }
+    log('info', 'Tamper demo OK — bad signature rejected', { eventName, reason: result.reason });
+    emitConfigPatch(eventName, tampered, { ok: false, reason: result.reason || 'bad_signature' });
+    return { ok: true, rejected: true, reason: result.reason || 'bad_signature' };
+  };
+
   const disconnect = () => {
     destroyed = true;
+    clearLeaseRenewInFlight();
     clearTimers();
     closeEventSource();
     connectionId = null;
+    lastSignedConfig = null;
+    configRuntime?.clearMacKey();
 
     if (ws) {
       ws.close(1000, 'User disconnected');
@@ -476,5 +1048,14 @@ export function createFlagmintConnection({ url, apiKey, transport, onFlags, onSt
     log('info', 'Disconnected');
   };
 
-  return { connect, sendContext, disconnect };
+  return {
+    connect,
+    sendContext,
+    requestFlag,
+    disconnect,
+    ensureConfigSyncLeaseFresh,
+    sendTrackEvent,
+    fetchRestConfig,
+    proveBadSignature,
+  };
 }
