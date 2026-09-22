@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createFlagmintConnection, CONNECTION_STATES } from './connection';
+import { createConfigSyncRuntime } from './configSyncRuntime';
 import { buildContextFromFields, CONTEXT_PRESETS, flagTypeLabel, flagValueDisplay, flagValueShort, TYPE_COLORS, logColor } from './helpers';
 import { ENVIRONMENTS, getEnvironment, inferEnvironmentId } from './environments';
 import { Tooltip } from './Tooltip';
@@ -230,6 +231,8 @@ export default function App() {
   const [trackEventName, setTrackEventName] = useState('goal_clicked');
   const [restSinceVersion, setRestSinceVersion] = useState('');
   const [restResult, setRestResult] = useState(null);
+  /** Only auto-fill flag key once per connect; clearing the field must stay empty. */
+  const didPrefillTrackFlag = useRef(false);
   const [qaBusy, setQaBusy] = useState(false);
   /** Bumps when the mirrored QA client clock changes so lease UI re-renders. */
   const [qaClockEpoch, setQaClockEpoch] = useState(0);
@@ -278,6 +281,11 @@ export default function App() {
   const isConnected = connState === CONNECTION_STATES.CONNECTED;
   const isConnecting = connState === CONNECTION_STATES.CONNECTING;
   const flagCount = Object.keys(flags).length;
+  /**
+   * Evaluate needs an in-memory flag map, not a live stream.
+   * Disconnect / stream cut keeps flags + RulesStore; only a fresh Connect clears them.
+   */
+  const canEvaluate = flagCount > 0;
   const isCustomEnv = envId === 'custom';
   const urlsLocked = isConnected || isConnecting;
 
@@ -335,6 +343,7 @@ export default function App() {
     setConfigMeta(null);
     setLastPatch(null);
     setRestResult(null);
+    didPrefillTrackFlag.current = false;
 
     const cache = loadLocalConfigCache(apiKey);
     const conn = createFlagmintConnection({
@@ -439,9 +448,34 @@ export default function App() {
   }, [apiKey, addLog]);
 
   const handleDisconnect = useCallback(() => {
+    // Keep connRef so offline Evaluate can still call requestFlag (RulesStore stays in memory).
     connRef.current?.disconnect();
-    connRef.current = null;
   }, []);
+
+  /**
+   * Offline config-sync getFlag from localCache when the live session was cleared.
+   *
+   * @param {string} key
+   * @param {Record<string, unknown>} ctx
+   * @returns {{ ok: boolean, value?: unknown, reason?: string, leaseExpired?: boolean, offlineCache?: boolean }}
+   */
+  const evaluateFlagFromLocalCache = useCallback((key, ctx) => {
+    const cache = apiKey ? loadLocalConfigCache(apiKey) : null;
+    if (!isLocalRulesCacheComplete(cache)) {
+      return { ok: false, reason: 'no_rules_cache' };
+    }
+    const runtime = createConfigSyncRuntime();
+    runtime.hydrateFromCache(cache);
+    if (!runtime.isLeaseReady()) {
+      const value = runtime.failClosedDefault(key);
+      return { ok: true, value, key, leaseExpired: true, offlineCache: true };
+    }
+    const result = runtime.evaluateFlag(key, ctx);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason, offlineCache: true };
+    }
+    return { ok: true, value: result.value, key, offlineCache: true };
+  }, [apiKey]);
 
   const handleSendContext = useCallback(() => {
     connRef.current?.sendContext(context);
@@ -449,8 +483,39 @@ export default function App() {
 
   const handleRequestFlag = useCallback(
     (key) => {
-      const result = connRef.current?.requestFlag?.(key, context);
-      if (!result) return;
+      let result = connRef.current?.requestFlag?.(key, context);
+
+      if (!result && syncMode === 'config') {
+        result = evaluateFlagFromLocalCache(key, context);
+        if (result.ok) {
+          addLog({
+            ts: new Date().toISOString(),
+            level: result.leaseExpired ? 'warn' : 'info',
+            msg: result.leaseExpired
+              ? `getFlag(${key}) offline cache — lease expired, fail-closed default`
+              : `getFlag(${key}) offline cache local eval`,
+            data: result,
+          });
+        }
+      } else if (!result && syncMode === 'legacy') {
+        const value = Object.prototype.hasOwnProperty.call(flags, key) ? flags[key] : undefined;
+        result = { ok: true, value, key, legacy: true, offline: true };
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'info',
+          msg: `getFlag(${key}) offline — last streamed snapshot`,
+          data: result,
+        });
+      }
+
+      if (!result) {
+        addLog({
+          ts: new Date().toISOString(),
+          level: 'warn',
+          msg: `getFlag(${key}) skipped — no session and no usable localCache`,
+        });
+        return;
+      }
       if (result.ok === false) {
         addLog({
           ts: new Date().toISOString(),
@@ -465,7 +530,7 @@ export default function App() {
         setFlags((prev) => ({ ...prev, [key]: result.value }));
       }
     },
-    [context, addLog],
+    [context, addLog, syncMode, flags, evaluateFlagFromLocalCache],
   );
 
   const handleSendTrack = useCallback(async () => {
@@ -529,11 +594,14 @@ export default function App() {
     });
   }, [addLog]);
 
-  // Prefill track flag from live flags
+  // Prefill track flag once when flags first arrive — do not refill if the user clears the field.
   useEffect(() => {
+    if (didPrefillTrackFlag.current) return;
     const keys = Object.keys(flags);
-    if (!trackFlagKey && keys.length > 0) setTrackFlagKey(keys[0]);
-  }, [flags, trackFlagKey]);
+    if (keys.length === 0) return;
+    didPrefillTrackFlag.current = true;
+    setTrackFlagKey((prev) => (prev.trim() ? prev : keys[0]));
+  }, [flags]);
 
   // Cleanup on unmount
   useEffect(() => () => connRef.current?.disconnect(), []);
@@ -1077,15 +1145,19 @@ export default function App() {
                                 <Tooltip
                                   content={
                                     syncMode === 'config'
-                                      ? 'Local getFlag(key) with sidebar context (call-site eval proof).'
-                                      : 'Legacy: logs a call-site request; value comes from last server snapshot.'
+                                      ? isConnected
+                                        ? 'Local getFlag(key) with sidebar context (call-site eval).'
+                                        : 'Offline local getFlag — uses rules still in memory. Lease expired → fail-closed defaults. (Use fullConfig / deltas mode.)'
+                                      : isConnected
+                                        ? 'Legacy: logs a call-site request; value comes from last server snapshot.'
+                                        : 'Offline: returns the last streamed snapshot (not live local rules). Switch Config sync → fullConfig / deltas for real offline local eval.'
                                   }
                                   position="left"
                                   multiline
                                 >
                                   <button
                                     type="button"
-                                    disabled={!isConnected}
+                                    disabled={!canEvaluate}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       handleRequestFlag(key);
@@ -1094,8 +1166,8 @@ export default function App() {
                                       ...S.preset,
                                       fontSize: 11,
                                       padding: '4px 10px',
-                                      opacity: isConnected ? 1 : 0.45,
-                                      cursor: isConnected ? 'pointer' : 'not-allowed',
+                                      opacity: canEvaluate ? 1 : 0.45,
+                                      cursor: canEvaluate ? 'pointer' : 'not-allowed',
                                     }}
                                   >
                                     Evaluate

@@ -2,6 +2,15 @@
 
 All notable changes to the Flagmint SDK Tester are documented in this file.
 
+## [1.3.1] — 2026-09-22
+
+### Changed
+
+- **Evaluate** stays enabled whenever flags are on screen, including after Disconnect / stream loss.
+- **Disconnect no longer drops the session object** — offline Evaluate can still call `requestFlag` against in-memory rules.
+- If the session is missing (e.g. hot reload), config-sync Evaluate falls back to **localCache** rules; legacy uses the last on-screen snapshot.
+- Tooltip explains offline behaviour per mode.
+
 ## [1.3.0] — 2026-09-20
 
 ### Added

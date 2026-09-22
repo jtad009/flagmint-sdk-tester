@@ -117,6 +117,23 @@ export function ToolsPanel({
           ))}
         </div>
         <label style={S.label}>Flag key</label>
+        <div style={hint}>
+          Pick a flag you already received, or type any key (including ones not in the list).
+        </div>
+        {flagKeys.length > 0 && (
+          <select
+            value={flagKeys.includes(trackFlagKey) ? trackFlagKey : ''}
+            onChange={(e) => {
+              if (e.target.value) setTrackFlagKey(e.target.value);
+            }}
+            style={{ ...S.input, marginBottom: 8, cursor: 'pointer' }}
+          >
+            <option value="">Received flags…</option>
+            {flagKeys.map((k) => (
+              <option key={k} value={k}>{k}</option>
+            ))}
+          </select>
+        )}
         <input
           list="fm-track-flag-keys"
           style={S.input}
