@@ -80,9 +80,16 @@ type TVariation = Variation;
 type SegmentSchemaType = Segment;
 type FlagValue = any;
 
+/**
+ * Normalize a value to string for eq/neq/in/nin (and related string ops).
+ * Trim + lowercase so `Alice@acme.com` matches `alice@acme.com`
+ * (same normalize used for PII hashing on the wire).
+ *
+ * @param value Context or rule value
+ */
 function toComparableString(value: unknown): string {
   if (value === null || value === undefined) return "";
-  return String(value);
+  return String(value).trim().toLowerCase();
 }
 
 function toComparableArray(value: unknown): string[] | null {

@@ -1,4 +1,9 @@
 import {
+  piiWireOptionsFromPayload,
+  resolvePiiWireForDelta,
+  type PiiWireOptions,
+} from './piiHash';
+import {
   isConfigPayloadExpired,
   verifyConfigPayloadSignature,
 } from './signPayload';
@@ -22,6 +27,8 @@ export type RulesState = {
   ready: boolean;
   /** Set when a delta's fromVersion does not match — reconnect with fullConfig. */
   needsFullConfig: boolean;
+  /** PII hash options from the last fullConfig/delta (null when absent). */
+  piiWire: PiiWireOptions | null;
 };
 
 export type ApplyResult =
@@ -40,6 +47,7 @@ export function createEmptyRulesState(): RulesState {
     segments: new Map(),
     ready: false,
     needsFullConfig: true,
+    piiWire: null,
   };
 }
 
@@ -51,6 +59,13 @@ function cloneState(state: RulesState): RulesState {
     segments: new Map(state.segments),
     ready: state.ready,
     needsFullConfig: state.needsFullConfig,
+    piiWire: state.piiWire
+      ? {
+          piiAttributes: [...state.piiWire.piiAttributes],
+          piiSalt: state.piiWire.piiSalt,
+          piiValueEncoding: state.piiWire.piiValueEncoding,
+        }
+      : null,
   };
 }
 
@@ -89,6 +104,7 @@ function hydrateFromFull(action: FullConfigPayload): RulesState {
     segments: segmentsFromRecord(action.segments),
     ready: true,
     needsFullConfig: false,
+    piiWire: piiWireOptionsFromPayload(action),
   };
 }
 
@@ -100,6 +116,9 @@ function applyPatch(state: RulesState, action: DeltaConfigPayload): RulesState {
   for (const flag of action.upserts || []) {
     if (flag?.key) flags.set(flag.key, flag);
   }
+  // Keep prior PII options only when the delta omits all PII fields.
+  // Explicit but unusable fields (empty salt / unknown encoding) clear them.
+  const nextPii = resolvePiiWireForDelta(state.piiWire, action);
   return {
     version: action.toVersion,
     expiresAt: typeof action.expiresAt === 'number' ? action.expiresAt : state.expiresAt,
@@ -107,6 +126,7 @@ function applyPatch(state: RulesState, action: DeltaConfigPayload): RulesState {
     segments: applySegmentUpserts(state.segments, action.segments),
     ready: true,
     needsFullConfig: false,
+    piiWire: nextPii,
   };
 }
 
@@ -314,11 +334,19 @@ export class RulesStore {
     this.state.segments.forEach((segment, id) => {
       segments[id] = segment;
     });
+    const pii = this.state.piiWire;
     return {
       version: this.state.version,
       expiresAt: this.state.expiresAt,
       flags: Array.from(this.state.flags.values()),
       segments,
+      ...(pii
+        ? {
+            piiAttributes: [...pii.piiAttributes],
+            piiSalt: pii.piiSalt,
+            piiValueEncoding: pii.piiValueEncoding,
+          }
+        : {}),
     };
   }
 
@@ -335,6 +363,7 @@ export class RulesStore {
       segments: segmentsFromRecord(snapshot.segments),
       ready: !expired && flags.size > 0,
       needsFullConfig: expired || flags.size === 0,
+      piiWire: piiWireOptionsFromPayload(snapshot),
     };
   }
 }
