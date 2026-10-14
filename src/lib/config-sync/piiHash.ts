@@ -7,9 +7,6 @@ export const PII_VALUE_ENCODING = 'hmac-v1' as const;
 
 const textEncoder = new TextEncoder();
 
-/** 64-char lowercase hex — already-hashed values are left alone. */
-const HASH_HEX_PATTERN = /^[0-9a-f]{64}$/;
-
 /**
  * Client PII wire options from signed `fullConfig` / `delta`.
  */
@@ -17,6 +14,15 @@ export type PiiWireOptions = {
   piiAttributes: string[];
   piiSalt: string;
   piiValueEncoding?: typeof PII_VALUE_ENCODING | string;
+};
+
+/**
+ * Extra apply options. Prefer plaintext context; only set `alreadyHashed`
+ * when callers intentionally supply wire digests (do not infer from hex shape).
+ */
+export type ApplyPiiHashMode = {
+  /** When true, leave PII string fields unchanged (caller supplied digests). */
+  alreadyHashed?: boolean;
 };
 
 /**
@@ -121,7 +127,11 @@ export function piiWireOptionsFromPayload(
 
 /**
  * Resolve PII wire options for a delta: keep prior when all PII fields are
- * absent; otherwise replace with the parsed options (or null if unusable).
+ * absent; otherwise parse after merging omitted fields from `previous`.
+ *
+ * FF-EU `piiMetadata` always emits the full triple (or nothing). Merge is
+ * defensive so a salt-only / attrs-only delta cannot wipe the other fields.
+ * Explicit empty salt or unknown encoding still clears to null.
  *
  * @param previous Current store options
  * @param action Delta (or similar) payload fields
@@ -133,20 +143,36 @@ export function resolvePiiWireForDelta(
   if (!payloadHasExplicitPiiFields(action)) {
     return previous;
   }
-  return piiWireOptionsFromPayload(action);
+  const merged: PiiWirePayloadFields = {
+    piiSalt: action!.piiSalt !== undefined ? action!.piiSalt : previous?.piiSalt,
+    piiAttributes:
+      action!.piiAttributes !== undefined
+        ? action!.piiAttributes
+        : previous?.piiAttributes,
+    piiValueEncoding:
+      action!.piiValueEncoding !== undefined
+        ? action!.piiValueEncoding
+        : previous?.piiValueEncoding,
+  };
+  return piiWireOptionsFromPayload(merged);
 }
 
 /**
  * Hash PII string fields on a flat evaluation context so they match hashed
  * rule values on the wire.
  *
+ * Always hashes plaintext strings (including values that look like 64-char hex).
+ * Pass `{ alreadyHashed: true }` only when the caller already supplied digests.
+ *
  * @param context Flat context map (after prepare / flatten)
  * @param options PII options from the rules store
+ * @param mode Optional apply mode (`alreadyHashed` skips hashing)
  * @returns New context object with PII strings hashed (or the input if no-op)
  */
 export function applyPiiHashToFlatContext(
   context: Record<string, unknown>,
   options: PiiWireOptions | null | undefined,
+  mode?: ApplyPiiHashMode,
 ): Record<string, unknown> {
   if (
     !options ||
@@ -156,6 +182,9 @@ export function applyPiiHashToFlatContext(
   ) {
     return context;
   }
+  if (mode?.alreadyHashed) {
+    return context;
+  }
 
   let changed = false;
   const out: Record<string, unknown> = { ...context };
@@ -163,7 +192,6 @@ export function applyPiiHashToFlatContext(
   for (const [key, value] of Object.entries(context)) {
     if (!isPiiAttribute(key, options.piiAttributes)) continue;
     if (typeof value === 'string') {
-      if (HASH_HEX_PATTERN.test(value)) continue;
       out[key] = hashPiiValue(value, options.piiSalt);
       changed = true;
       continue;
@@ -172,7 +200,6 @@ export function applyPiiHashToFlatContext(
       let arrayChanged = false;
       const next = value.map((entry) => {
         if (typeof entry !== 'string') return entry;
-        if (HASH_HEX_PATTERN.test(entry)) return entry;
         arrayChanged = true;
         return hashPiiValue(entry, options.piiSalt);
       });

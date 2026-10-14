@@ -58,7 +58,7 @@ export {
   resolvePiiWireForDelta,
   applyPiiHashToFlatContext,
 } from './piiHash';
-export type { PiiWireOptions } from './piiHash';
+export type { PiiWireOptions, ApplyPiiHashMode } from './piiHash';
 export {
   evaluateRule,
   evaluateKillSwitch,
