@@ -298,11 +298,18 @@ export function createFlagmintConnection({
     }
 
     lastSignedConfig = { eventName, payload };
+    const piiWire = result.state.piiWire;
     log('info', `Config-sync ${eventName} verified + applied`, {
       version: result.state.version,
       expiresAt: result.state.expiresAt,
       flagsInStore: result.state.flags.size,
       needsFullConfig: result.state.needsFullConfig,
+      ...(piiWire
+        ? {
+            piiAttributes: piiWire.piiAttributes,
+            piiValueEncoding: piiWire.piiValueEncoding,
+          }
+        : {}),
       ...summarizeConfigPatch(eventName, payload),
     });
     emitConfigPatch(eventName, payload, { ok: true });

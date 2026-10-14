@@ -31,7 +31,15 @@ export function createConfigSyncRuntime() {
     /**
      * Hydrate RulesStore from localCache using the tester QA clock.
      *
-     * @param {{ version?: number, expiresAt?: number, flags?: unknown[], segments?: Record<string, unknown> }|null|undefined} cache
+     * @param {{
+     *   version?: number,
+     *   expiresAt?: number,
+     *   flags?: unknown[],
+     *   segments?: Record<string, unknown>,
+     *   piiAttributes?: string[],
+     *   piiSalt?: string,
+     *   piiValueEncoding?: string,
+     * }|null|undefined} cache
      * @param {number} [now=qaClientNowMs()]
      * @returns {boolean}
      */
@@ -43,6 +51,13 @@ export function createConfigSyncRuntime() {
           expiresAt: cache.expiresAt ?? 0,
           flags: cache.flags,
           segments: cache.segments ?? {},
+          ...(cache.piiSalt
+            ? {
+                piiAttributes: cache.piiAttributes,
+                piiSalt: cache.piiSalt,
+                piiValueEncoding: cache.piiValueEncoding,
+              }
+            : {}),
         },
         now,
       );
@@ -91,12 +106,12 @@ export function createConfigSyncRuntime() {
       if (!store.isReady(now)) {
         return { ok: false, reason: 'lease_expired' };
       }
-      const { flags, segments } = store.getState();
+      const { flags, segments, piiWire } = store.getState();
       const flag = flags.get(key);
       if (!flag) {
         return { ok: false, reason: 'flag_not_in_store' };
       }
-      const value = evaluateSdkFlag(flag, context ?? {}, segments);
+      const value = evaluateSdkFlag(flag, context ?? {}, segments, piiWire);
       return { ok: true, value };
     },
 
@@ -135,10 +150,19 @@ export function createConfigSyncRuntime() {
   };
 }
 
+/**
+ * Local eval of all flags; hashes PII context fields when the store has wire options.
+ *
+ * @param {import('@flagmint/config-sync').RulesStore} store
+ * @param {Record<string, unknown>|null|undefined} context
+ * @returns {Record<string, unknown>}
+ */
 function evaluateLocal(store, context) {
-  const { flags, segments, ready } = store.getState();
+  const { flags, segments, ready, piiWire } = store.getState();
   if (!ready || flags.size === 0) {
     return {};
   }
-  return evaluateAllSdkFlags(Array.from(flags.values()), context ?? {}, segments);
+  return evaluateAllSdkFlags(Array.from(flags.values()), context ?? {}, segments, {
+    pii: piiWire,
+  });
 }

@@ -28,7 +28,8 @@ Watch lease / last payload under Config sync.`,
     body: `Add kind/key and targeting attributes, then **Send Context** (or reconnect).
 
 - Config-sync re-evaluates locally
-- Legacy waits for a stream update`,
+- Legacy waits for a stream update
+- If the project marks attributes as PII (e.g. \`email\`), put **plaintext** in context — local eval hashes them the same way the wire rules do`,
   },
   {
     title: '5. QA clock / data (staging)',

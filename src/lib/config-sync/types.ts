@@ -31,6 +31,13 @@ export type LeasePayload = {
   signature: string;
 };
 
+/** PII hashing metadata on client-bound config (FF-EU Phase B). */
+export type PiiWireMetadata = {
+  piiAttributes?: string[];
+  piiSalt?: string;
+  piiValueEncoding?: string;
+};
+
 export type FullConfigPayload = {
   type: 'fullConfig';
   version: number;
@@ -40,7 +47,7 @@ export type FullConfigPayload = {
   segments: Record<string, SdkSegment>;
   warnings?: string[];
   signature: string;
-};
+} & PiiWireMetadata;
 
 export type DeltaConfigPayload = {
   type: 'delta';
@@ -52,7 +59,7 @@ export type DeltaConfigPayload = {
   deletes: string[];
   segments: Record<string, SdkSegment>;
   signature: string;
-};
+} & PiiWireMetadata;
 
 export type DeltasCatchUpPayload = {
   type: 'deltas';
@@ -75,4 +82,8 @@ export type RulesCacheSnapshot = {
   expiresAt: number;
   flags: SdkFlagConfig[];
   segments: Record<string, SdkSegment>;
+  /** PII wire options so offline hydrate still hashes context correctly. */
+  piiAttributes?: string[];
+  piiSalt?: string;
+  piiValueEncoding?: string;
 };

@@ -916,6 +916,14 @@ export default function App() {
                                 ? 'lease expired → fail-closed defaults + reconnect'
                                 : 'SSE + ECDH MAC verify → local eval'}
                             </div>
+                            {Array.isArray(cache?.piiAttributes) && cache?.piiSalt && (
+                              <div style={{ marginTop: 4 }}>
+                                pii: {cache.piiAttributes.length
+                                  ? cache.piiAttributes.join(', ')
+                                  : '(none)'}{' '}
+                                ({cache.piiValueEncoding || 'hmac-v1'})
+                              </div>
+                            )}
                             {leaseExpiresAt != null && (
                               <div style={{ color: t.accentSoft, marginTop: 4 }}>
                                 lease exp {new Date(leaseExpiresAt).toISOString()}

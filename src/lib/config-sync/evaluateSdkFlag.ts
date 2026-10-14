@@ -16,6 +16,10 @@ import {
   type Variation,
 } from './flagEvaluator';
 import { flattenEvaluationContext } from './flattenContext';
+import {
+  applyPiiHashToFlatContext,
+  type PiiWireOptions,
+} from './piiHash';
 import type { SdkFlagConfig, SdkSegment } from './types';
 
 /** ES2018-safe Map → record (avoids Object.fromEntries / ES2019 lib). */
@@ -74,14 +78,36 @@ export function prepareContextForEvaluator(
 }
 
 /**
+ * Flatten prepared context, then hash PII fields so they match hashed rule
+ * values on the config-sync wire (FF-EU Phase B / SDK Phase C).
+ *
+ * @param context Evaluation or flat context
+ * @param pii PII wire options from the rules store (null/undefined = no-op)
+ */
+export function prepareContextForLocalEval(
+  context: Record<string, unknown> | null | undefined,
+  pii?: PiiWireOptions | null,
+): Record<string, unknown> {
+  const prepared = prepareContextForEvaluator(context);
+  const flat = flattenEvaluationContext(prepared);
+  return applyPiiHashToFlatContext(flat, pii);
+}
+
+/**
  * Evaluate one SdkFlagConfig against context (server RuleEngine order).
+ *
+ * @param flag Compiled flag config
+ * @param context Evaluation context (plaintext PII is hashed when `pii` is set)
+ * @param segments Segment map for segment rules
+ * @param pii Optional PII wire options from the signed config
  */
 export function evaluateSdkFlag(
   flag: SdkFlagConfig,
   context: Record<string, unknown>,
   segments: Map<string, SdkSegment> | Record<string, SdkSegment>,
+  pii?: PiiWireOptions | null,
 ): FlagEvaluationResult {
-  const evalContext = prepareContextForEvaluator(context);
+  const evalContext = prepareContextForLocalEval(context, pii);
   const variationsById: Record<string, Variation> = {};
   for (const v of flag.variations || []) {
     if (v?.id) variationsById[v.id] = v;
@@ -142,14 +168,22 @@ export function evaluateSdkFlag(
   }
 }
 
+/**
+ * Evaluate every flag in a map/list against one context.
+ *
+ * @param flags Flag configs
+ * @param context Shared evaluation context
+ * @param segments Segment map
+ * @param options Fail-closed and PII wire options
+ */
 export function evaluateAllSdkFlags<T = unknown>(
   flags: Map<string, SdkFlagConfig> | SdkFlagConfig[],
   context: Record<string, unknown>,
   segments: Map<string, SdkSegment> | Record<string, SdkSegment>,
-  options?: { failClosedDefaultsOnly?: boolean },
+  options?: { failClosedDefaultsOnly?: boolean; pii?: PiiWireOptions | null },
 ): Record<string, T> {
   const list = flags instanceof Map ? Array.from(flags.values()) : flags;
-  const prepared = prepareContextForEvaluator(context);
+  const prepared = prepareContextForLocalEval(context, options?.pii);
   const out: Record<string, T> = {};
   for (const flag of list) {
     if (!flag?.key) continue;
@@ -157,9 +191,8 @@ export function evaluateAllSdkFlags<T = unknown>(
       out[flag.key] = coerceType(flag.default_value, flag.type) as T;
       continue;
     }
-    // Context already prepared — pass through by using a prefixed flat map /
-    // structured kind so prepareContextForEvaluator is a no-op.
-    out[flag.key] = evaluateSdkFlag(flag, prepared, segments) as T;
+    // Context already prepared + PII-hashed — pass flat map so local prep is a no-op.
+    out[flag.key] = evaluateSdkFlag(flag, prepared, segments, null) as T;
   }
   return out;
 }
